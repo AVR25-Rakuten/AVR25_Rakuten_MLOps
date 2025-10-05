@@ -1,0 +1,31 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restrict to Internal Proxy
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/subject: Pod
+spec:
+  # Piloté par ta variable Ansible
+  validationFailureAction: {{ 'Enforce' if kyverno_enforce|bool else 'Audit' }}
+  background: true
+  rules:
+  - name: only-from-internal-proxy
+    match:
+      resources:
+        kinds: ["Pod"]
+    exclude:
+      resources:
+        namespaces: ["kube-system","kyverno"]
+    validate:
+      message: "Toutes les images doivent venir de {{ nfq_proxy_host }}."
+      # Utilise les anchors Kyverno =(field) pour gérer les champs optionnels
+      pattern:
+        spec:
+          =(containers):
+          - =(image): "{{ nfq_proxy_host }}/*"
+          =(initContainers):
+          - =(image): "{{ nfq_proxy_host }}/*"
+          =(ephemeralContainers):
+          - =(image): "{{ nfq_proxy_host }}/*"

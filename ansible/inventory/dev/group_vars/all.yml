@@ -35,3 +35,26 @@ cri_socket: "unix:///var/run/containerd/containerd.sock"
 cilium_version: "1.18.2"
 enable_hubble: true
 enable_hubble_ui: true
+
+
+nfq_gateway_ip: "192.168.200.1"
+nfq_proxy_port: 8000           # FastAPI TLS (ton proxy)
+nfq_registry_port: 5000        # Tampon registry (registry:2) HTTP
+nfq_proxy_host: "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}"
+
+# Kyverno
+kyverno_namespace: kyverno
+kyverno_version: "3.5.0"
+kyverno_enforce: false           # start in Audit to avoid regressions
+kyverno_install_policies: false  # optionnel
+kyverno_mutate_prepend: true     # ✅ on active la mutation pour réécrire toutes les images
+
+
+
+# roles/helm/tasks/cilium_helm_apply.yml
+cilium_version: "1.18.2"
+pod_cidr_v4: "10.244.0.0/16"
+pool_mask_v4: 24
+cilium_enable_kpr: false       # activer la phase 2 plus tard
+cilium_kpr_mode: "strict"      # "probe" | "partial" | "strict"
+cilium_enable_hubble: false    # activer la phase 3 plus tard

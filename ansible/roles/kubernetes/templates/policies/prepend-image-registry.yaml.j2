@@ -1,0 +1,142 @@
+{% raw %}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: prepend-image-registry
+  annotations:
+    policies.kyverno.io/title: Prepend Image Registry
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/subject: Pod
+spec:
+  background: false
+  rules:
+  - name: prepend-for-all
+    match:
+      resources:
+        kinds: ["Pod"]
+    exclude:
+      resources:
+        namespaces: ["kube-system","kyverno"]
+    preconditions:
+      all:
+      - key: "{{ request.operation }}"
+        operator: In
+        value: ["CREATE","UPDATE"]
+
+    mutate:
+      foreach:
+
+      # --- containers: SANS registry (=> docker.io sous proxy) ---
+      - list: "request.object.spec.containers || []"
+        preconditions:
+          all:
+          - key: "{{ contains(split(element.image, '/')[0], '.') }}"
+            operator: Equals
+            value: false
+          - key: "{{ contains(split(element.image, '/')[0], ':') }}"
+            operator: Equals
+            value: false
+          - key: "{{ starts_with(split(element.image, '/')[0], 'localhost') }}"
+            operator: Equals
+            value: false
+        patchStrategicMerge:
+          spec:
+            containers:
+            - name: "{{ element.name }}"
+              image: "{% endraw %}{{ nfq_proxy_host }}{% raw %}/docker.io/{{ element.image }}"
+
+      # --- containers: AVEC registry (=> préfixer par le proxy) ---
+      - list: "request.object.spec.containers || []"
+        preconditions:
+          any:
+          - key: "{{ contains(split(element.image, '/')[0], '.') }}"
+            operator: Equals
+            value: true
+          - key: "{{ contains(split(element.image, '/')[0], ':') }}"
+            operator: Equals
+            value: true
+          - key: "{{ starts_with(split(element.image, '/')[0], 'localhost') }}"
+            operator: Equals
+            value: true
+        patchStrategicMerge:
+          spec:
+            containers:
+            - name: "{{ element.name }}"
+              image: "{% endraw %}{{ nfq_proxy_host }}{% raw %}/{{ element.image }}"
+
+      # --- initContainers: SANS registry ---
+      - list: "request.object.spec.initContainers || []"
+        preconditions:
+          all:
+          - key: "{{ contains(split(element.image, '/')[0], '.') }}"
+            operator: Equals
+            value: false
+          - key: "{{ contains(split(element.image, '/')[0], ':') }}"
+            operator: Equals
+            value: false
+          - key: "{{ starts_with(split(element.image, '/')[0], 'localhost') }}"
+            operator: Equals
+            value: false
+        patchStrategicMerge:
+          spec:
+            initContainers:
+            - name: "{{ element.name }}"
+              image: "{% endraw %}{{ nfq_proxy_host }}{% raw %}/docker.io/{{ element.image }}"
+
+      # --- initContainers: AVEC registry ---
+      - list: "request.object.spec.initContainers || []"
+        preconditions:
+          any:
+          - key: "{{ contains(split(element.image, '/')[0], '.') }}"
+            operator: Equals
+            value: true
+          - key: "{{ contains(split(element.image, '/')[0], ':') }}"
+            operator: Equals
+            value: true
+          - key: "{{ starts_with(split(element.image, '/')[0], 'localhost') }}"
+            operator: Equals
+            value: true
+        patchStrategicMerge:
+          spec:
+            initContainers:
+            - name: "{{ element.name }}"
+              image: "{% endraw %}{{ nfq_proxy_host }}{% raw %}/{{ element.image }}"
+
+      # --- ephemeralContainers: SANS registry ---
+      - list: "request.object.spec.ephemeralContainers || []"
+        preconditions:
+          all:
+          - key: "{{ contains(split(element.image, '/')[0], '.') }}"
+            operator: Equals
+            value: false
+          - key: "{{ contains(split(element.image, '/')[0], ':') }}"
+            operator: Equals
+            value: false
+          - key: "{{ starts_with(split(element.image, '/')[0], 'localhost') }}"
+            operator: Equals
+            value: false
+        patchStrategicMerge:
+          spec:
+            ephemeralContainers:
+            - name: "{{ element.name }}"
+              image: "{% endraw %}{{ nfq_proxy_host }}{% raw %}/docker.io/{{ element.image }}"
+
+      # --- ephemeralContainers: AVEC registry ---
+      - list: "request.object.spec.ephemeralContainers || []"
+        preconditions:
+          any:
+          - key: "{{ contains(split(element.image, '/')[0], '.') }}"
+            operator: Equals
+            value: true
+          - key: "{{ contains(split(element.image, '/')[0], ':') }}"
+            operator: Equals
+            value: true
+          - key: "{{ starts_with(split(element.image, '/')[0], 'localhost') }}"
+            operator: Equals
+            value: true
+        patchStrategicMerge:
+          spec:
+            ephemeralContainers:
+            - name: "{{ element.name }}"
+              image: "{% endraw %}{{ nfq_proxy_host }}{% raw %}/{{ element.image }}"
+{% endraw %}

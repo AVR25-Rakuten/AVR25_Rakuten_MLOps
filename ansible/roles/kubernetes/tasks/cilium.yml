@@ -1,0 +1,179 @@
+---
+# roles/helm/tasks/cilium_helm_apply.yml
+# Variables attendues (exemples à mettre dans group_vars/all.yml)
+# cilium_version: "1.18.2"
+# nfq_proxy_host: "192.168.200.1:8000"
+# pod_cidr_v4: "10.244.0.0/16"
+# pool_mask_v4: 24
+# cilium_enable_kpr: false       # activer la phase 2 plus tard
+# cilium_kpr_mode: "strict"      # "probe" | "partial" | "strict"
+# cilium_enable_hubble: false    # activer la phase 3 plus tard
+
+- name: Add Cilium Helm repo
+  kubernetes.core.helm_repository:
+    name: cilium
+    repo_url: https://helm.cilium.io/
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, helm]
+
+# -----------------------
+# Phase 1 — Bootstrap CNI
+# (équivalent à ton phase1.yaml rendu : KPR off + IPAM cluster-pool)
+# -----------------------
+- name: Install/upgrade Cilium (phase 1 - bootstrap, no wait)
+  kubernetes.core.helm:
+    name: cilium
+    chart_ref: cilium/cilium
+    release_namespace: kube-system
+    create_namespace: false
+    chart_version: "{{ cilium_version }}"
+    wait: false
+    atomic: false
+    values:
+      # Tout passe par le proxy/tampon
+      global:
+        imageRegistry: "{{ nfq_proxy_host }}"
+      image:
+        repository: "quay.io/cilium/cilium"
+      operator:
+        image:
+          repository: "quay.io/cilium/operator-generic"
+
+      # KPR OFF (on l'activera en phase 2)
+      kubeProxyReplacement: "disabled"
+
+      # IPAM identique à ton template phase1
+      ipam:
+        mode: "cluster-pool"
+        operator:
+          clusterPoolIPv4PodCIDRList: ["{{ pod_cidr_v4 }}"]
+          clusterPoolIPv4MaskSize: {{ pool_mask_v4 }}
+
+      # Tunnel par défaut (ajuste si besoin : vxlan/geneve/disabled)
+      tunnel: "vxlan"
+
+      # Hubble OFF (on l'activera en phase 3)
+      hubble:
+        enabled: false
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase1]
+
+- name: Ensure cilium-operator object exists (light wait)
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: kube-system
+    name: cilium-operator
+  register: cilium_op
+  until: cilium_op.resources | length > 0
+  retries: 60
+  delay: 5
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase1]
+
+# -----------------------
+# Phase 2 — Activer KPR
+# (équivalent à ton phase2-kpr.yaml : KPR on + IPAM kubernetes)
+# -----------------------
+- name: Enable kubeProxyReplacement (phase 2)
+  when: cilium_enable_kpr | default(false) | bool
+  kubernetes.core.helm:
+    name: cilium
+    chart_ref: cilium/cilium
+    release_namespace: kube-system
+    chart_version: "{{ cilium_version }}"
+    wait: false
+    atomic: false
+    values:
+      global:
+        imageRegistry: "{{ nfq_proxy_host }}"
+      image:
+        repository: "quay.io/cilium/cilium"
+      operator:
+        image:
+          repository: "quay.io/cilium/operator-generic"
+
+      # Active KPR comme tu le veux (probe/partial/strict)
+      kubeProxyReplacement: "{{ cilium_kpr_mode }}"
+
+      # IPAM comme dans ton phase2 template
+      ipam:
+        mode: "kubernetes"
+
+      tunnel: "vxlan"
+      hubble: { enabled: false }
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase2]
+
+# -----------------------
+# Phase 3 — Activer Hubble
+# (équivalent à ton phase3-hubble.yaml)
+# -----------------------
+- name: Enable Hubble (phase 3)
+  when: cilium_enable_hubble | default(false) | bool
+  kubernetes.core.helm:
+    name: cilium
+    chart_ref: cilium/cilium
+    release_namespace: kube-system
+    chart_version: "{{ cilium_version }}"
+    wait: false
+    atomic: false
+    values:
+      global:
+        imageRegistry: "{{ nfq_proxy_host }}"
+      image:
+        repository: "quay.io/cilium/cilium"
+      operator:
+        image:
+          repository: "quay.io/cilium/operator-generic"
+
+      # Garde KPR au bon état si la phase 2 a été activée avant
+      kubeProxyReplacement: "{{ cilium_kpr_mode if (cilium_enable_kpr | bool) else 'disabled' }}"
+      ipam:
+        # si tu restes en cluster-pool, remets-le ici ;
+        # sinon on laisse 'kubernetes' si la phase 2 est activée
+        mode: "{{ 'kubernetes' if (cilium_enable_kpr | bool) else 'cluster-pool' }}"
+        operator:
+          clusterPoolIPv4PodCIDRList: ["{{ pod_cidr_v4 }}"]
+          clusterPoolIPv4MaskSize: {{ pool_mask_v4 }}
+
+      tunnel: "vxlan"
+
+      hubble:
+        enabled: true
+        relay:
+          enabled: true
+        ui:
+          enabled: true
+          # service type/ingress se configurent ici si besoin
+          # ingress:
+          #   enabled: false
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase3]
+
+# Debug non bloquant
+- name: List Cilium pods (debug)
+  command: kubectl -n kube-system get pods -l k8s-app=cilium -o wide
+  register: cilium_pods
+  changed_when: false
+  failed_when: false
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, check]

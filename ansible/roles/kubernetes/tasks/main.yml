@@ -11,8 +11,16 @@
   include_tasks: label_nodes.yml
   tags: label_nodes
 
+- name: Include Helm tasks
+  include_tasks: helm.yml
+  tags: helm
+
+- name: Include Helm tasks
+  include_tasks: kyverno.yml
+  tags: kyverno
+
 - name: Include CNI tasks
-  include_tasks: cni.yml
+  include_tasks: cilium.yml
   tags: cilium
 
 - name: Include MetalLB tasks
@@ -20,7 +28,7 @@
   tags: metallb
 
 - name: Include CSI tasks
-  include_tasks: csi.yml
+  include_tasks: mayastor.yml
   tags: mayastor
 
 - name: Include Dashboard tasks

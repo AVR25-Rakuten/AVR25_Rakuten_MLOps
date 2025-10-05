@@ -1,9 +1,0 @@
-apiVersion: openebs.io/v1beta3
-kind: DiskPool
-metadata:
-  name: pool-k8s-data3
-  namespace: openebs
-spec:
-  node: k8s-data3
-  disks:
-    - /dev/nvme0n2

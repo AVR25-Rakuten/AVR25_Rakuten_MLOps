@@ -1,11 +1,48 @@
 ---
 # Fichier: roles/kubernetes/tasks/install.yml
-# Description: Installe et prépare les répertoires de rendu/copie des manifests (Cilium + MetalLB + OpenEBS)
-- name: Stop unattended-upgrades service
-  systemd:
-    name: unattended-upgrades
-    state: stopped
+# --- FAST MODE: débloquer APT/Dpkg sans attendre ---
+- name: Hard-stop APT and free locks (fast mode)
+  block:
+    - name: Stop & mask apt services/timers
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        masked: yes
+        enabled: no
+      loop:
+        - unattended-upgrades
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - apt-daily.service
+        - apt-daily-upgrade.service
+      ignore_errors: yes
+
+    - name: Kill any lingering apt/dpkg processes
+      shell: |
+        pgrep -f 'apt.systemd.daily|unattended-upgrade|apt-get|aptitude|dpkg' | xargs -r kill -9
+      changed_when: false
+      failed_when: false
+
+    - name: Remove dpkg/apt lock files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/dpkg/lock-frontend
+        - /var/lib/dpkg/lock
+        - /var/cache/apt/archives/lock
+      changed_when: false
+      failed_when: false
+
+    - name: Quickly fix half-configured packages
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      shell: |
+        dpkg --configure -a || true
+      changed_when: false
+      failed_when: false
   tags: install
+
 
 
 # Configuration initiale
@@ -67,11 +104,6 @@
       command: sysctl --system
   tags: install
 
-
-
-
-
-
 - name: Check if apt lock file exists
   stat:
     path: /var/lib/apt/lists/lock
@@ -83,15 +115,6 @@
     state: absent
   when: apt_lock_file.stat.exists
 
-# - name: Update apt package cache with verbose output
-#   command: apt-get update -o Debug::pkgProblemResolver=1
-#   register: update_output
-#   tags: install
-
-# - name: Display update output
-#   debug:
-#     var: update_output
-#   tags: install
 - name: Check if dpkg lock frontend file exists
   stat:
     path: /var/lib/dpkg/lock-frontend
@@ -112,6 +135,7 @@
     name: "{{ item }}"
     state: present
     update_cache: yes
+    force_apt_get: yes
   loop:
     - apt-transport-https
     - ca-certificates
@@ -167,33 +191,133 @@
       args:
         creates: /etc/containerd/config.toml
 
-    # Configure containerd pour Kubernetes
+    # # Configure containerd pour Kubernetes
+    # - name: Configure containerd for Kubernetes
+    #   copy:
+    #     dest: /etc/containerd/config.toml
+    #     content: |
+    #       version = 2
+    #       [plugins."io.containerd.runtime.v1.linux"]
+    #         [plugins."io.containerd.runtime.v1.linux".runtimes]
+    #           [plugins."io.containerd.runtime.v1.linux".runtimes.runc]
+    #             runtime_type = "io.containerd.runc.v2"
+    #       [plugins."io.containerd.grpc.v1.cri"]
+    #         disable = false
+    #         sandbox_image = "registry.k8s.io/pause:3.10.1"
+    #         [plugins."io.containerd.grpc.v1.cri".containerd]
+    #           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+    #             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+    #               runtime_type = "io.containerd.runc.v2"
+    #               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+    #                 SystemdCgroup = true
+    #         [plugins."io.containerd.grpc.v1.cri".registry]
+    #           [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+    #               endpoint = ["https://registry-1.docker.io"]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
+    #               endpoint = ["https://registry.k8s.io"]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."192.168.200.1:5000"]
+    #               endpoint = ["http://192.168.200.1:5000"]
+
+    # # Configure containerd pour Kubernetes
+    # - name: Configure containerd for Kubernetes
+    #   copy:
+    #     dest: /etc/containerd/config.toml
+    #     content: |
+    #       version = 2
+
+    #       [plugins."io.containerd.grpc.v1.cri"]
+    #         disable = false
+    #         # IMPORTANT: image 'pause' via proxy
+    #         sandbox_image = "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}/registry.k8s.io/pause:3.10.1"
+
+    #         # Active la lecture des hosts.toml (par-registry)
+    #         [plugins."io.containerd.grpc.v1.cri".registry]
+    #           config_path = "/etc/containerd/certs.d"
+
+    #           [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+    #               endpoint = ["https://registry-1.docker.io"]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
+    #               endpoint = ["https://registry.k8s.io"]
+    #             # (garde ou retire ce miroir HTTP local si tu l’utilises ailleurs)
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."{{ nfq_gateway_ip }}:{{ nfq_registry_port }}"]
+    #               endpoint = ["http://{{ nfq_gateway_ip }}:{{ nfq_registry_port }}"]
+
+    #         [plugins."io.containerd.grpc.v1.cri".containerd]
+    #           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+    #             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+    #               runtime_type = "io.containerd.runc.v2"
+    #               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+    #                 SystemdCgroup = true
+
+    # # Configure containerd pour Kubernetes
+    # - name: Configure containerd for Kubernetes
+    #   copy:
+    #     dest: /etc/containerd/config.toml
+    #     content: |
+    #       version = 2
+    #       [plugins."io.containerd.runtime.v1.linux"]
+    #         [plugins."io.containerd.runtime.v1.linux".runtimes]
+    #           [plugins."io.containerd.runtime.v1.linux".runtimes.runc]
+    #             runtime_type = "io.containerd.runc.v2"
+    #       [plugins."io.containerd.grpc.v1.cri"]
+    #         disable = false
+    #         sandbox_image = "{{ nfq_proxy_host }}/registry.k8s.io/pause:3.10.1"
+    #         [plugins."io.containerd.grpc.v1.cri".containerd]
+    #           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+    #             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+    #               runtime_type = "io.containerd.runc.v2"
+    #               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+    #                 SystemdCgroup = true
+    #         [plugins."io.containerd.grpc.v1.cri".registry]
+    #           [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+    #               endpoint = ["https://{{ nfq_proxy_host }}/registry-1.docker.io"]
+    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
+    #               endpoint = ["https://{{ nfq_proxy_host }}/registry.k8s.io"]
+
     - name: Configure containerd for Kubernetes
       copy:
         dest: /etc/containerd/config.toml
         content: |
           version = 2
-          [plugins."io.containerd.runtime.v1.linux"]
-            [plugins."io.containerd.runtime.v1.linux".runtimes]
-              [plugins."io.containerd.runtime.v1.linux".runtimes.runc]
-                runtime_type = "io.containerd.runc.v2"
+
           [plugins."io.containerd.grpc.v1.cri"]
             disable = false
-            sandbox_image = "registry.k8s.io/pause:3.10.1"
+            # OK de garder le sandbox via proxy (voir plus bas pour aligner kubeadm)
+            sandbox_image = "{{ nfq_proxy_host }}/registry.k8s.io/pause:3.10.1"
+
+            # ⚠️ INDISPENSABLE: active la lecture des /etc/containerd/certs.d/<registry>/hosts.toml
+            [plugins."io.containerd.grpc.v1.cri".registry]
+              config_path = "/etc/containerd/certs.d"
+
             [plugins."io.containerd.grpc.v1.cri".containerd]
               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
                 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
                   runtime_type = "io.containerd.runc.v2"
                   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
                     SystemdCgroup = true
-            [plugins."io.containerd.grpc.v1.cri".registry]
-              [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-                [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-                  endpoint = ["https://registry-1.docker.io"]
-                [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-                  endpoint = ["https://registry.k8s.io"]
-                [plugins."io.containerd.grpc.v1.cri".registry.mirrors."192.168.200.1:5000"]
-                  endpoint = ["http://192.168.200.1:5000"]
+
+
+
+    - name: Ensure certs.d dir for containerd proxy
+      file:
+        path: "/etc/containerd/certs.d/{{ nfq_proxy_host }}"
+        state: directory
+        mode: '0755'
+
+    - name: Configure hosts.toml for proxy (TLS skip verify)
+      copy:
+        dest: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/hosts.toml"
+        mode: '0644'
+        content: |
+          server = "https://{{ nfq_proxy_host }}"
+          [host."https://{{ nfq_proxy_host }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+
+
 
     # Configure le service systemd pour containerd
     - name: Configure containerd systemd service
@@ -451,6 +575,25 @@
         mode: '0644'
       when: inventory_hostname == groups['masters'][0]
 
+
+
+    # # 1) Installer Helm sur master1 (idempotent)
+    # - name: Ensure Helm is installed (on first master)
+    #   import_tasks: helm.yml
+    #   when: inventory_hostname in groups['masters']
+    #   tags: ['helm', 'kyverno']
+
+    # # 2) Installer & configurer Kyverno (utilise helm)
+    # - name: Install & configure Kyverno (on first master only)
+    #   import_tasks: kyverno.yml
+    #   when: inventory_hostname == groups['masters']
+    #   tags: ['install', 'kyverno']
+
+
+
+
+
+
     # Génère la clé de certificat
     - name: Get certificate key
       command: kubeadm certs certificate-key
@@ -595,10 +738,66 @@
   tags: install
 
 
+# --- Python deps pour modules kubernetes.core (sur master1) ---
+- name: Ensure Python deps for kubernetes.core on master1 (system site-packages)
+  become: yes
+  when: inventory_hostname == groups['masters']
+  block:
+    - name: Install pip3
+      apt:
+        name: python3-pip
+        state: present
+        update_cache: yes
+
+    # PEP 668: on force l’install dans l’environnement système (OK sur tes VMs dédiées)
+    - name: Install Python libs needed by kubernetes.core
+      pip:
+        name:
+          - kubernetes
+          - PyYAML
+          - requests
+          - packaging
+          - jsonpatch
+        executable: pip3
+        extra_args: "--break-system-packages"
+
+    - name: Verify Python kubernetes import
+      command: python3 -c "import kubernetes, yaml, requests; print('k8s-py-ok')"
 
 
-- name: Start unattended-upgrades service
-  systemd:
-    name: unattended-upgrades
-    state: started
+# --- RESTORE MODE: réactiver APT/Dpkg auto après l'install ---
+- name: Re-enable APT services/timers (restore mode)
+  block:
+    - name: Unmask apt services/timers
+      systemd:
+        name: "{{ item }}"
+        masked: no
+      loop:
+        - unattended-upgrades
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - apt-daily.service
+        - apt-daily-upgrade.service
+      ignore_errors: yes
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable & start apt timers
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      ignore_errors: yes
+
+    - name: Enable & start unattended-upgrades
+      systemd:
+        name: unattended-upgrades
+        enabled: yes
+        state: started
+      ignore_errors: yes
   tags: install
