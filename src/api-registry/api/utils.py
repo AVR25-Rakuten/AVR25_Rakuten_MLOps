@@ -4,6 +4,7 @@ import subprocess
 import platform
 import time
 import httpx
+import re
 
 # Base URL du registry tampon (interne)
 REG_LOCAL_BASE_URL = os.getenv("REG_LOCAL_BASE_URL", "http://internal-registry:5000")
@@ -36,13 +37,16 @@ _MANIFEST_ACCEPT = (
 )
 
 _TRANSIENT_ERR_SNIPPETS = (
-    "TLS handshake timeout",
+    "tls handshake timeout",
+    "handshake timeout",
     "i/o timeout",
-    "Client.Timeout exceeded",
-    "EOF",
+    "client.timeout exceeded",
+    "connection timed out",
     "temporary failure",
     "connection reset",
-    "PROXY",
+    "unexpected eof",
+    "eof",
+    "proxy",
 )
 
 def _norm_arch(x: str) -> str:
@@ -68,8 +72,8 @@ def _compose_upstream_digest(reg: str, name: str, digest: str) -> str:
     host_ns = f"{reg}/{name}" if _has_domain(reg) else f"{UPSTREAM_REGISTRY}/{reg}/{name}"
     return f"{host_ns}@{digest}"
 
-def _tls_flags(src=False, dest=False):
-    flags = []
+def _tls_flags(src: bool = False, dest: bool = False) -> list[str]:
+    flags: list[str] = []
     if src and INSECURE_SRC:
         flags += ["--src-tls-verify=false"]
     if dest and INSECURE_DEST:
@@ -88,25 +92,61 @@ def _run_skopeo(args: list[str]) -> str:
             return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
             out = e.output or str(e)
-            # Erreurs transitoires fréquentes derrière VPN/proxy
-            if any(snip.lower() in out.lower() for snip in _TRANSIENT_ERR_SNIPPETS):
+            if any(snip in out.lower() for snip in _TRANSIENT_ERR_SNIPPETS):
                 last_err = out
                 delay = SKOPEO_BACKOFF_BASE * (2 ** attempt)
                 time.sleep(delay)
                 attempt += 1
                 continue
-            # Sinon, on remonte directement
             raise
-        except Exception as e:  # sécurité
+        except Exception as e:
             last_err = str(e)
             delay = SKOPEO_BACKOFF_BASE * (2 ** attempt)
             time.sleep(delay)
             attempt += 1
             continue
-    # Après tous les retries, échoue proprement
     if last_err:
         raise RuntimeError(f"skopeo retried {SKOPEO_RETRIES} times and still failed: {last_err}")
     raise RuntimeError(f"skopeo failed after {SKOPEO_RETRIES} attempts")
+
+def _is_manifest_list_src(src_ref: str) -> bool:
+    """
+    Détermine si la source (docker://…) est un manifest list / OCI index.
+    Utilise `skopeo inspect --raw` et détecte la présence de 'manifests' dans le JSON.
+    """
+    cmd = ["skopeo", "inspect", "--raw"]
+    if INSECURE_SRC:
+        cmd += ["--tls-verify=false"]
+    cmd += [f"docker://{src_ref}"]
+    raw = _run_skopeo(cmd)
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "manifests" in data:
+            return True
+        mt = data.get("mediaType") or ""
+        return ("manifest.list" in mt) or ("image.index" in mt)
+    except Exception:
+        # fallback simple si pas JSON "propre"
+        return "manifests" in raw
+
+def _platform_overrides() -> list[str]:
+    if MIRROR_ALL_ARCHS:
+        return ["--all"]
+    arch = PLATFORM_ARCH or _norm_arch(platform.machine())
+    flags = [f"--override-os={PLATFORM_OS}", f"--override-arch={arch}"]
+    if PLATFORM_VARIANT:
+        flags.append(f"--override-variant={PLATFORM_VARIANT}")
+    return flags
+
+def _synth_tag_from_digest(digest: str) -> str:
+    """
+    Génère un tag sûr à partir d’un digest. Ex: sha256:abc… -> bydigest-sha256-abc…
+    (max ~120 char pour rester confortable côté registry)
+    """
+    t = digest.replace(":", "-")
+    if len(t) > 120:
+        t = t[:120]
+    return f"bydigest-{t}"
 
 def skopeo_inspect_digest(ref: str) -> str:
     """
@@ -131,36 +171,59 @@ async def local_has_manifest(reg: str, name: str, digest: str) -> bool:
     url = f"{REG_LOCAL_BASE_URL}/v2/{reg}/{name}/manifests/{digest}"
     async with httpx.AsyncClient(timeout=None) as client:
         r = await client.head(url, headers={"Accept": _MANIFEST_ACCEPT})
-    return r.status_code == 200
+    return r.status_code == 200 and bool(r.headers.get("Docker-Content-Digest"))
 
 def copy_to_local_digest(reg: str, name: str, digest: str) -> None:
     """
-    Copie par DIGEST (manifest simple, pas manifest list).
+    Copie une référence source par DIGEST vers le registry tampon **en TAG** (jamais en @sha).
+    - Si la source est un manifest list: copie --all (si MIRROR_ALL_ARCHS) ou force la plate-forme.
+    - Le tag destination est synthétique et dérivé du digest (stable/idempotent).
     """
-    src_ref = _compose_upstream_digest(reg, name, digest)
+    src_ref = _compose_upstream_digest(reg, name, digest)  # host/ns/name@sha256:...
+    dest_tag = _synth_tag_from_digest(digest)
     src = f"docker://{src_ref}"
-    dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}@{digest}"
-    cmd = ["skopeo", "copy", "--retry-times", "3"] + _tls_flags(src=True, dest=True) + [src, dest]
+    dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}:{dest_tag}"
+
+    base = ["skopeo", "copy", "--retry-times", "3"] + _tls_flags(src=True, dest=True)
+    is_index = False
+    try:
+        is_index = _is_manifest_list_src(src_ref)
+    except Exception:
+        # Si on n'arrive pas à déterminer, on tente copie simple (puis fallback plate-forme au besoin)
+        is_index = False
+
+    if is_index:
+        cmd = base + _platform_overrides() + [src, dest]
+    else:
+        cmd = base + [src, dest]
+
     _run_skopeo(cmd)
 
 def copy_to_local_tag(reg: str, name: str, ref: str) -> None:
     """
     Copie par TAG.
-      - MIRROR_ALL_ARCHS=true  -> --all (manifest list + variantes)  [plus lent]
+      - MIRROR_ALL_ARCHS=true  -> --all (manifest list + variantes)
       - sinon (défaut)         -> single-arch via --override-os/--override-arch[/--override-variant]
     """
-    src_ref = _compose_upstream_tag(reg, name, ref)
+    src_ref = _compose_upstream_tag(reg, name, ref)  # host/ns/name:tag
     src = f"docker://{src_ref}"
     dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}:{ref}"
+
     base = ["skopeo", "copy", "--retry-times", "3"] + _tls_flags(src=True, dest=True)
 
-    if MIRROR_ALL_ARCHS:
-        cmd = base + ["--all", src, dest]
+    # Détecte manifest list pour décider --all / overrides
+    is_index = False
+    try:
+        is_index = _is_manifest_list_src(src_ref)
+    except Exception:
+        is_index = False
+
+    if is_index:
+        cmd = base + _platform_overrides() + [src, dest]
     else:
-        arch = PLATFORM_ARCH or _norm_arch(platform.machine())
-        cmd = base + [f"--override-os={PLATFORM_OS}", f"--override-arch={arch}"]
-        if PLATFORM_VARIANT:
-            cmd += [f"--override-variant={PLATFORM_VARIANT}"]
-        cmd += [src, dest]
+        if MIRROR_ALL_ARCHS:
+            cmd = base + ["--all", src, dest]
+        else:
+            cmd = base + _platform_overrides() + [src, dest]
 
     _run_skopeo(cmd)

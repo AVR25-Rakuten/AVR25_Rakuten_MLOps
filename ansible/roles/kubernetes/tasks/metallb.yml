@@ -1,148 +1,134 @@
 ---
-# roles/kubernetes/tasks/metallb.yml
-- name: MetalLB — Déploiement complet
-  vars:
-    metallb_namespace: "metallb-system"
-    metallb_version: "0.13.12"
-    render_dir: "/etc/helm/rendered/metallb"
-    download_dir: "{{ playbook_dir }}/templates/metallb-rendered"
-    upload_dir: "{{ playbook_dir }}/rendered_local/metallb"
-    remote_render_dir: "/etc/helm/rendered/metallb"
-  block:
-    # 1. Créer les répertoires
-    - name: Créer les répertoires
-      file:
-        path: "{{ item }}"
-        state: directory
-        mode: "0755"
-      loop:
-        - "{{ render_dir }}"
-        - "{{ download_dir }}"
-        - "{{ upload_dir }}"
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
-      when: item.startswith('/etc/')
+# Variables attendues (exemples à mettre dans group_vars/all.yml)
+# metallb_namespace: "metallb-system"
+# metallb_version: "0.13.12"
+# nfq_proxy_host: "192.168.200.1:8000"
+#
+# Optionnel : définir les pools si tu veux les créer automatiquement
+# metallb_pools:
+#   - name: default
+#     addresses:
+#       - "192.168.200.240-192.168.200.250"
+#     autoL2Adv: true   # si true, on génère aussi un L2Advertisement pour ce pool
 
-    - name: Créer les répertoires locaux
-      file:
-        path: "{{ item }}"
-        state: directory
-        mode: "0755"
-      loop:
-        - "{{ download_dir }}"
-        - "{{ upload_dir }}"
-      run_once: true
-      delegate_to: localhost
-      become: no
+- name: Add MetalLB Helm repo
+  kubernetes.core.helm_repository:
+    name: metallb
+    repo_url: https://metallb.github.io/metallb
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, helm]
 
-    # 2. Configurer le dépôt Helm
-    - name: Configurer le dépôt MetalLB
-      shell: |
-        set -euo pipefail
-        helm repo add metallb https://metallb.github.io/metallb || true
-        helm repo update
-      args:
-        executable: /bin/bash
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
+- name: Ensure namespace {{ metallb_namespace }}
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata: { name: "{{ metallb_namespace }}" }
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, ns]
 
-    # 3. Générer le manifest complet
-    - name: Générer le manifest MetalLB
-      shell: |
-        set -euo pipefail
-        helm template metallb metallb/metallb \
-          --version {{ metallb_version }} \
-          --namespace {{ metallb_namespace }} \
-          --include-crds \
-          > "{{ render_dir }}/metallb-combined.yaml"
-      args:
-        executable: /bin/bash
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
+# Installation MetalLB via Helm
+# - wait=false pour éviter de bloquer si le CNI n'est pas encore up
+# - on préfixe toutes les images via le proxy tampon
+# - on conserve les repositories d’origine (Kyverno peut aussi préprépender si besoin)
+- name: Install/upgrade MetalLB (Helm)
+  kubernetes.core.helm:
+    name: metallb
+    chart_ref: metallb/metallb
+    release_namespace: "{{ metallb_namespace }}"
+    create_namespace: false
+    chart_version: "{{ metallb_version }}"
+    wait: false
+    atomic: false
+    values:
+      global:
+        imageRegistry: "{{ nfq_proxy_host }}"
+      controller:
+        image:
+          repository: "quay.io/metallb/controller"
+      speaker:
+        image:
+          repository: "quay.io/metallb/speaker"
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, helm]
 
-    # 4. Extraire les CRDs
-    - name: Extraire les CRDs avec yq
-      shell: |
-        set -euo pipefail
-        yq 'select(.kind == "CustomResourceDefinition")' "{{ render_dir }}/metallb-combined.yaml" > "{{ render_dir }}/metallb-crds.yaml"
-      args:
-        executable: /bin/bash
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
+# (léger) Wait: s’assurer que les objets existent (sans exiger Ready)
+- name: Wait until metallb controller Deployment exists
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ metallb_namespace }}"
+    name: controller
+  register: mlb_ctrl
+  until: mlb_ctrl.resources | length > 0
+  retries: 60
+  delay: 5
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, check]
 
-    # 5. Rapatrier les fichiers
-    - name: Rapatrier les manifests
-      fetch:
-        src: "{{ render_dir }}/{{ item.src }}"
-        dest: "{{ download_dir }}/{{ item.dest }}"
-        flat: yes
-      loop:
-        - { src: "metallb-crds.yaml", dest: "metallb-crds.yaml" }
-        - { src: "metallb-combined.yaml", dest: "metallb-combined.yaml" }
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
+# (Optionnel) CRs IPAddressPool + L2Advertisement
+- name: Apply IPAddressPool(s)
+  when: metallb_pools is defined and metallb_pools | length > 0
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ metallb_namespace }}"
+      spec:
+        addresses: "{{ item.addresses }}"
+  loop: "{{ metallb_pools }}"
+  loop_control: { label: "{{ item.name }}" }
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, pools]
 
-    # 6. Uploader les fichiers
-    - name: Uploader les manifests
-      copy:
-        src: "{{ download_dir }}/{{ item.src }}"
-        dest: "{{ remote_render_dir }}/{{ item.dest }}"
-        mode: "0644"
-      loop:
-        - { src: "metallb-crds.yaml", dest: "metallb-crds.yaml" }
-        - { src: "metallb-combined.yaml", dest: "metallb-combined.yaml" }
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
+- name: Apply L2Advertisement(s) for pools with autoL2Adv=true
+  when: metallb_pools is defined and (metallb_pools | selectattr('autoL2Adv','defined') | list | length) > 0
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: "l2adv-{{ item.name }}"
+        namespace: "{{ metallb_namespace }}"
+      spec:
+        ipAddressPools:
+          - "{{ item.name }}"
+  loop: "{{ metallb_pools | selectattr('autoL2Adv', 'defined') | selectattr('autoL2Adv') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, pools]
 
-    # 7. Créer le namespace
-    - name: Créer le namespace metallb-system
-      command: kubectl create namespace {{ metallb_namespace }}
-      register: ns_create
-      failed_when: ns_create.rc != 0 and 'already exists' not in ns_create.stderr
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
-      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-
-    # 8. Appliquer les CRDs
-    - name: Appliquer les CRDs MetalLB
-      command: kubectl apply -f {{ remote_render_dir }}/metallb-crds.yaml
-      run_once: true
-      register: crd_apply
-      until: crd_apply.rc == 0
-      retries: 100
-      delay: 5
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
-      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-
-    # 9. Appliquer le manifest principal
-    - name: Appliquer le manifest MetalLB
-      command: kubectl apply -f {{ remote_render_dir }}/metallb-combined.yaml
-      run_once: true
-      register: manifest_apply
-      until: manifest_apply.rc == 0
-      retries: 100
-      delay: 5
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
-      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-
-    # 10. Vérifier l'installation
-    - name: Vérifier les pods MetalLB
-      command: kubectl -n {{ metallb_namespace }} get pods
-      register: metallb_pods
-      until: metallb_pods.stdout.find('Running') != -1
-      retries: 100
-      delay: 10
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
-      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [metallb]
+# Debug non bloquant
+- name: List MetalLB pods (debug)
+  command: kubectl -n {{ metallb_namespace }} get pods -o wide
+  register: metallb_pods
+  changed_when: false
+  failed_when: false
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [metallb, check]

@@ -23,29 +23,6 @@
   when: item in k8s_nodes.stdout.split()
   tags: taint_nodes
 
-# # Applique les taints aux nœuds master (optionnel, selon vos besoins)
-# - name: Taint master nodes
-#   command: kubectl taint nodes {{ item }} node-role.kubernetes.io/master=true:NoSchedule --overwrite
-#   loop: "{{ groups['masters'] | default([]) }}"
-#   delegate_to: "{{ groups['masters'][0] }}"
-#   run_once: true
-#   become: yes
-#   environment:
-#     KUBECONFIG: /etc/kubernetes/admin.conf
-#   when: item in k8s_nodes.stdout.split()
-#   tags: taint_nodes
-
-# # Applique les taints aux nœuds worker (optionnel, selon vos besoins)
-# - name: Taint worker nodes
-#   command: kubectl taint nodes {{ item }} node-role.kubernetes.io/worker=true:NoSchedule --overwrite
-#   loop: "{{ groups['workers'] | default([]) }}"
-#   delegate_to: "{{ groups['masters'][0] }}"
-#   run_once: true
-#   become: yes
-#   environment:
-#     KUBECONFIG: /etc/kubernetes/admin.conf
-#   when: item in k8s_nodes.stdout.split()
-#   tags: taint_nodes
 
 # Applique les taints aux nœuds data (optionnel, selon vos besoins)
 - name: Taint data nodes

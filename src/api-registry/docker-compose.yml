@@ -1,8 +1,8 @@
 services:
-  registry-nfq:
+  api-registry:
     build:
       context: .
-    container_name: registry-nfq
+    container_name: api-registry
     ports:
       - "443:443"     # Nginx health
       - "8000:8000"   # FastAPI proxy (TLS)

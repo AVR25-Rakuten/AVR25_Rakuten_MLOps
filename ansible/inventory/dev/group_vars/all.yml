@@ -31,12 +31,6 @@ systemd_cgroup: true
 # Configuration CRI
 cri_socket: "unix:///var/run/containerd/containerd.sock"
 
-# Configuration Cilium
-cilium_version: "1.18.2"
-enable_hubble: true
-enable_hubble_ui: true
-
-
 nfq_gateway_ip: "192.168.200.1"
 nfq_proxy_port: 8000           # FastAPI TLS (ton proxy)
 nfq_registry_port: 5000        # Tampon registry (registry:2) HTTP
@@ -51,10 +45,21 @@ kyverno_mutate_prepend: true     # ✅ on active la mutation pour réécrire tou
 
 
 
-# roles/helm/tasks/cilium_helm_apply.yml
+
+
 cilium_version: "1.18.2"
+# nfq_proxy_host: "192.168.200.1:8000"
 pod_cidr_v4: "10.244.0.0/16"
 pool_mask_v4: 24
-cilium_enable_kpr: false       # activer la phase 2 plus tard
-cilium_kpr_mode: "strict"      # "probe" | "partial" | "strict"
-cilium_enable_hubble: false    # activer la phase 3 plus tard
+cilium_enable_kpr: true                 # activer la phase 2 plus tard
+cilium_enable_hubble: true              # activer la phase 3 plus tard
+cilium_phase1_routing_mode: "tunnel"     # "tunnel" (overlay) ou "native"
+cilium_phase2_routing_mode: "native"     # recommandé quand KPR=true
+cilium_tunnel_protocol: "vxlan"          # utilisé si routingMode == "tunnel"
+
+
+# Prérequis variables :
+kube_system_ns: "kube-system"
+
+# - cilium_image_tag / cilium_operator_tag (optionnels)
+# - cilium_enable_kpr / cilium_enable_hubble (optionnels)

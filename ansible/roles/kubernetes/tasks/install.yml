@@ -741,7 +741,7 @@
 # --- Python deps pour modules kubernetes.core (sur master1) ---
 - name: Ensure Python deps for kubernetes.core on master1 (system site-packages)
   become: yes
-  when: inventory_hostname == groups['masters']
+  when: inventory_hostname in groups['masters']
   block:
     - name: Install pip3
       apt:
