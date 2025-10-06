@@ -7,6 +7,8 @@ from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request, Response
 import httpx
 
+import os, sys
+sys.path.insert(0, os.path.dirname(__file__))
 from utils import (
     skopeo_inspect_digest,
     copy_to_local_digest,
