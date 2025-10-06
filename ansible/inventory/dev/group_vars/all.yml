@@ -61,5 +61,3 @@ cilium_tunnel_protocol: "vxlan"          # utilisé si routingMode == "tunnel"
 # Prérequis variables :
 kube_system_ns: "kube-system"
 
-# - cilium_image_tag / cilium_operator_tag (optionnels)
-# - cilium_enable_kpr / cilium_enable_hubble (optionnels)

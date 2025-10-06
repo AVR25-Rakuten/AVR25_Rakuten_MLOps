@@ -2,31 +2,28 @@ import os
 import re
 import time
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from fastapi import FastAPI, Request, Response
 import httpx
 
-import os, sys
+import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from utils import (
     skopeo_inspect_digest,
     copy_to_local_digest,
-    copy_to_local_tag,
     local_has_manifest,
-    REG_LOCAL_BASE_URL,  # même valeur que côté utils
+    REG_LOCAL_BASE_URL,
 )
 
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8000"))
 LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
 MAX_CONCURRENT_COPIES = int(os.getenv("MAX_CONCURRENT_COPIES", "4"))
+REGISTRY_NFQ_CA_PATH = os.getenv("REGISTRY_NFQ_CA_PATH", "/certs/nfq-registry-ca.pem")
 
-# Concurrency + dédup
-ensure_lock = asyncio.Lock()  # protège l'accès à 'inflight'
+# Concurrency + déduplication
+ensure_lock = asyncio.Lock()
 sem = asyncio.Semaphore(MAX_CONCURRENT_COPIES)
-
-# Clé = "reg/name@sha256:..."
-# Valeur = dict(state, lock, started, reg, name, ref, digest, waiters, attempts, last_error)
 inflight: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI()
@@ -38,28 +35,27 @@ METRICS = {
     "errors": 0,
 }
 
-_MANIFEST_ACCEPT = ",".join(
-    [
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-        "application/json",
-    ]
-)
+_MANIFEST_ACCEPT = ",".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/json",
+])
 
-# --------- Helpers de parsing des chemins V2 ---------
+# ------------------- Helpers -------------------
+
 def parse_manifest_path(path: str):
-    # /v2/<reg>/<name>/manifests/<ref>
     m = re.match(r"^/v2/([^/]+)/(.+)/manifests/([^/]+)$", path)
     return m.groups() if m else None
 
-
 def parse_blob_path(path: str):
-    # /v2/<reg>/<name>/blobs/sha256:....
     m = re.match(r"^/v2/([^/]+)/(.+)/blobs/(sha256:[0-9a-f]{64})$", path)
     return m.groups() if m else None
 
+def digest_to_tag(digest: str) -> str:
+    # "sha256:abcd..." -> "bydigest-sha256-abcd..."
+    return f"bydigest-{digest.replace(':','-')}"
 
 def _inflight_public_view(entry: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -68,7 +64,7 @@ def _inflight_public_view(entry: Dict[str, Any]) -> Dict[str, Any]:
         "name": entry["name"],
         "ref": entry.get("ref"),
         "digest": entry.get("digest"),
-        "state": entry["state"],  # queued|copying
+        "state": entry["state"],
         "started": entry["started"],
         "age_sec": round(time.time() - entry["started"], 3),
         "waiters": entry["waiters"],
@@ -76,20 +72,50 @@ def _inflight_public_view(entry: Dict[str, Any]) -> Dict[str, Any]:
         "last_error": entry.get("last_error"),
     }
 
+# ------------------- API -------------------
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+@app.get("/metrics")
+async def metrics():
+    METRICS["inflight"] = len(inflight)
+    return METRICS
+
+@app.get("/inflight")
+async def list_inflight():
+    now = time.time()
+    items = []
+    for entry in list(inflight.values()):
+        if entry["state"] in ("queued", "copying"):
+            view = _inflight_public_view(entry)
+            view["age_sec"] = round(now - entry["started"], 3)
+            items.append(view)
+    return {"count": len(items), "items": items}
+
+@app.get("/ca", response_class=Response)
+async def get_ca():
+    """
+    Retourne le certificat CA autosigné utilisé par le proxy/registry.
+    Permet aux clients d'importer le CA dans leur magasin de certificats.
+    """
+    if not os.path.exists(REGISTRY_NFQ_CA_PATH):
+        return Response("CA not found", status_code=404)
+    with open(REGISTRY_NFQ_CA_PATH, "rb") as f:
+        content = f.read()
+    # application/x-pem-file convient pour un .pem
+    return Response(content, media_type="application/x-pem-file")
+
+@app.get("/v2/")
+async def ping():
+    return Response(status_code=200)
+
+# ------------------- Core logic -------------------
 
 async def _ensure_entry(reg: str, name: str, ref: str) -> Dict[str, Any]:
-    """
-    Renvoie l'entrée inflight (existante ou nouvellement créée) + son lock.
-    Incrémente 'waiters'.
-    """
-    if ref.startswith("sha256:"):
-        digest_hint = ref
-    else:
-        digest_hint = None
-
+    digest_hint = ref if ref.startswith("sha256:") else None
     async with ensure_lock:
-        # Si on a déjà le digest, on peut clé directement; sinon on clé temporairement par ref
-        # mais on remplacera par le vrai digest dès qu'on le connaît.
         key = f"{reg}/{name}@{digest_hint or ref}"
         entry = inflight.get(key)
         if not entry:
@@ -109,108 +135,46 @@ async def _ensure_entry(reg: str, name: str, ref: str) -> Dict[str, Any]:
         entry["waiters"] += 1
         return entry
 
-
 async def _rekey_entry_if_digest_known(entry: Dict[str, Any], digest: str) -> Dict[str, Any]:
-    """
-    Si l'entrée a été créée à partir d'un tag (ref) et que le digest est connu,
-    on déplace la clé inflight vers 'reg/name@digest' pour dédup stricte.
-    """
     if entry.get("digest") == digest:
         return entry
-
     reg, name = entry["reg"], entry["name"]
     old_key = f"{reg}/{name}@{entry.get('digest') or entry.get('ref')}"
     new_key = f"{reg}/{name}@{digest}"
-
     async with ensure_lock:
         if old_key == new_key:
             return entry
-        # Si une entrée avec digest existe déjà, on fusionne 'waiters' et on renvoie l'autre.
         existing = inflight.get(new_key)
         if existing:
             existing["waiters"] += max(0, entry["waiters"] - 1)
-            # On efface l'ancienne
             inflight.pop(old_key, None)
             return existing
         else:
-            # Rekey: on remplace la clé
             entry["digest"] = digest
             inflight[new_key] = entry
             inflight.pop(old_key, None)
             return entry
 
-
 async def _release_entry(entry: Dict[str, Any]):
-    """
-    Décrémente 'waiters'; si plus personne n'attend et state != copying/queued,
-    on supprime l'entrée de la table inflight.
-    """
     reg, name = entry["reg"], entry["name"]
     key = f"{reg}/{name}@{entry.get('digest') or entry.get('ref')}"
     async with ensure_lock:
         entry["waiters"] = max(0, entry["waiters"] - 1)
-        # On ne garde dans inflight que ce qui est "en cours" (queued/copying)
         if entry["state"] not in ("queued", "copying"):
-            # 'done' ou 'error' -> on retire si plus d'attente
             if entry["waiters"] == 0:
                 inflight.pop(key, None)
 
-
-# ------------------- API -------------------
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
-
-
-@app.get("/metrics")
-async def metrics():
-    # Ajoute métrique runtime des inflight
-    METRICS["inflight"] = len(inflight)
-    return METRICS
-
-
-@app.get("/inflight")
-async def list_inflight():
-    """
-    Liste des ensures en cours (queued/copying).
-    """
-    # Snapshot non bloquant
-    items = []
-    now = time.time()
-    for entry in list(inflight.values()):
-        if entry["state"] in ("queued", "copying"):
-            view = _inflight_public_view(entry)
-            # rafraîchit l'age
-            view["age_sec"] = round(now - entry["started"], 3)
-            items.append(view)
-    return {"count": len(items), "items": items}
-
-
-@app.get("/v2/")
-async def ping():
-    return Response(status_code=200)
-
-
 async def ensure_local(reg: str, name: str, ref: str) -> str:
-    """
-    Garantit que l'image (par digest) est présente dans le registry tampon.
-    Retourne le digest final (sha256:...).
-    Dédup stricte par digest et concurrency limit via semaphore.
-    """
     entry = await _ensure_entry(reg, name, ref)
     lock: asyncio.Lock = entry["lock"]
-
     async with lock:
-        # Si on connait pas le digest, résout-le (hors section critique des copies, mais sous lock d'entrée)
         try:
             if entry.get("digest") and entry["digest"].startswith("sha256:"):
                 digest = entry["digest"]
             else:
-                # ref -> digest
                 digest = await asyncio.get_event_loop().run_in_executor(
                     None, skopeo_inspect_digest, f"{reg}/{name}:{ref}"
                 )
-            # Rekey par digest pour dédup stricte
             entry = await _rekey_entry_if_digest_known(entry, digest)
         except Exception as e:
             entry["state"] = "error"
@@ -219,7 +183,6 @@ async def ensure_local(reg: str, name: str, ref: str) -> str:
             await _release_entry(entry)
             raise
 
-        # Hit local ?
         try:
             if await local_has_manifest(reg, name, digest):
                 METRICS["ensures_hit"] += 1
@@ -227,18 +190,15 @@ async def ensure_local(reg: str, name: str, ref: str) -> str:
                 await _release_entry(entry)
                 return digest
         except Exception as e:
-            # On loggue mais on tente la copie (peut réparer)
             entry["last_error"] = f"local_has_manifest failed: {e}"
 
         METRICS["ensures_miss"] += 1
         entry["state"] = "queued"
 
-        # Limite globale de copies concurrentes
         async with sem:
             entry["state"] = "copying"
             entry["attempts"] += 1
             try:
-                # Copie par DIGEST -> dest tag synthétique gérée côté utils
                 await asyncio.get_event_loop().run_in_executor(
                     None, copy_to_local_digest, reg, name, digest
                 )
@@ -252,98 +212,121 @@ async def ensure_local(reg: str, name: str, ref: str) -> str:
                 await _release_entry(entry)
                 raise
 
+# ------------------- Ensure status -------------------
 
 @app.get("/ensure-status/{reg}/{name}/{ref}")
 async def ensure_status(reg: str, name: str, ref: str, request: Request):
     """
-    200 si déjà présent localement (par digest si ref=digest, sinon on tente HEAD via accept).
+    200 si présent localement (par digest ou par tag synthétique).
     202 si en cours (avec Retry-After).
-    404 si non trouvé et pas en cours.
+    404 sinon.
     """
-    # Tente HEAD local direct par ref (si digest) sinon par Accept qui peut renvoyer le digest
-    try:
-        if ref.startswith("sha256:"):
+    accept_hdr = request.headers.get("accept") or _MANIFEST_ACCEPT
+
+    async def _local_head(ref_like: str) -> bool:
+        """HEAD vers le registre local pour vérifier l'existence d'un manifest."""
+        url = f"{REG_LOCAL_BASE_URL}/v2/{reg}/{name}/manifests/{ref_like}"
+        async with httpx.AsyncClient(timeout=None, verify=False) as client:
+            r = await client.request("HEAD", url, headers={"Accept": accept_hdr})
+            return r.status_code != 404
+
+    # 1) Si ref est un digest : teste local_has_manifest puis fallback HEAD sur bydigest-…
+    if ref.startswith("sha256:"):
+        try:
             if await local_has_manifest(reg, name, ref):
                 return Response(status_code=200)
-        else:
-            # On résout le digest rapidement (non bloquant si call distant lent -> 202)
+        except Exception:
+            pass
+        # fallback HTTP sur le tag synthétique
+        if await _local_head(digest_to_tag(ref)):
+            return Response(status_code=200)
+
+    # 2) Si ref est un tag : tente de résoudre le digest puis testes
+    else:
+        try:
+            digest = await asyncio.get_event_loop().run_in_executor(
+                None, skopeo_inspect_digest, f"{reg}/{name}:{ref}"
+            )
             try:
-                digest = await asyncio.get_event_loop().run_in_executor(
-                    None, skopeo_inspect_digest, f"{reg}/{name}:{ref}"
-                )
                 if await local_has_manifest(reg, name, digest):
                     return Response(status_code=200)
             except Exception:
                 pass
-    except Exception:
-        pass
+            if await _local_head(digest_to_tag(digest)):
+                return Response(status_code=200)
+        except Exception:
+            # impossible de résoudre, on continue
+            pass
 
-    # Regarder inflight
-    key_digest = f"{reg}/{name}@{ref if ref.startswith('sha256:') else ref}"
-    # Cherche entrée par digest si possible
-    for k, e in inflight.items():
+    # 3) Vérifie les ensures en cours
+    for e in inflight.values():
         if e["reg"] == reg and e["name"] == name:
             if e.get("digest") == ref or e.get("ref") == ref:
                 if e["state"] in ("queued", "copying"):
                     return Response(status_code=202, headers={"Retry-After": "2"})
-    # Rien en cours
+
+    # 4) Rien trouvé
     return Response(status_code=404)
 
+# ------------------- Routes -------------------
 
 @app.api_route("/v2/{reg}/{path:path}", methods=["GET", "HEAD"])
 async def v2_router(request: Request, reg: str, path: str):
-    """
-    Proxy/ensure des endpoints Docker Registry:
-      - /v2/<reg>/<name>/manifests/<ref>
-      - /v2/<reg>/<name>/blobs/<sha256:...>
-    Support 'async=1' pour un 202 immédiat avec prefetch en arrière-plan.
-    """
     METRICS["requests_total"] += 1
     q = dict(request.query_params)
     is_async = q.get("async") in ("1", "true", "yes")
     prefer = request.headers.get("Prefer", "")
-
     full_path = f"/v2/{reg}/{path}"
+
     m = parse_manifest_path(full_path)
     if m:
         METRICS["ensures"] += 1
         reg_m, name, ref = m
 
-        # Mode async (respond-async)
+        # Mode async: déclenche en arrière-plan et 202 de suite
         if is_async or "respond-async" in prefer.lower():
             async def _bg():
                 try:
                     await ensure_local(reg_m, name, ref)
                 except Exception:
-                    # La gestion d'erreur est déjà stockée dans 'inflight'
                     pass
-
             asyncio.create_task(_bg())
-            status_url = f"/ensure-status/{reg_m}/{name}/{ref}"
-            return Response(status_code=202, headers={"Location": status_url, "Retry-After": "2"})
+            return Response(
+                status_code=202,
+                headers={"Location": f"/ensure-status/{reg_m}/{name}/{ref}", "Retry-After": "2"},
+            )
 
-        # Mode sync (HEAD/GET)
+        # Mode sync: ensure local puis proxy via refs existantes (digest -> fallback bydigest-…)
         try:
             digest = await ensure_local(reg_m, name, ref)
         except Exception as e:
             return Response(str(e), status_code=502)
 
-        # Proxy vers le tampon
-        # - HEAD: on garde {ref} pour le cas où un client head un tag (Docker-Content-Digest suit).
-        # - GET: on peut renvoyer par digest pour stabilité.
-        target_ref = ref if request.method == "HEAD" else digest
-        url = f"{REG_LOCAL_BASE_URL}/v2/{reg_m}/{name}/manifests/{target_ref}"
+        accept_hdr = request.headers.get("accept") or _MANIFEST_ACCEPT
+        candidate_refs = [digest, digest_to_tag(digest)]
+
         async with httpx.AsyncClient(timeout=None, verify=False) as client:
-            upstream = await client.request(
-                request.method, url, headers={"Accept": request.headers.get("accept", "*/*")}
-            )
+            last = None
+            for target_ref in candidate_refs:
+                url = f"{REG_LOCAL_BASE_URL}/v2/{reg_m}/{name}/manifests/{target_ref}"
+                upstream = await client.request(
+                    request.method, url, headers={"Accept": accept_hdr}
+                )
+                if upstream.status_code != 404:
+                    return Response(
+                        content=upstream.content,
+                        status_code=upstream.status_code,
+                        headers=dict(upstream.headers),
+                    )
+                last = upstream
+
+        # Si tout est 404, renvoyer le dernier 404
         return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=dict(upstream.headers),
+            content=last.content if last else b"",
+            status_code=last.status_code if last else 404,
+            headers=dict(last.headers) if last else {},
         )
 
-    # Blobs: simple proxy pass vers le tampon (le manifest ensure aura peuplé les blobs)
     b = parse_blob_path(full_path)
     if b:
         reg_b, name, dg = b
@@ -357,7 +340,6 @@ async def v2_router(request: Request, reg: str, path: str):
         )
 
     return Response(status_code=404)
-
 
 if __name__ == "__main__":
     import uvicorn

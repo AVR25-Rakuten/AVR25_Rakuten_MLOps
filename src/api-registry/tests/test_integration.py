@@ -1,6 +1,8 @@
 import os, time, subprocess, shutil
 import requests
 import pytest
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 
 PROXY_BASE = os.getenv("PROXY_BASE", "https://localhost:8000")
 VERIFY = os.getenv("TLS_VERIFY", "false").lower() in ("1","true","yes")
@@ -15,6 +17,20 @@ def test_proxy_is_up():
     assert r.status_code == 200
     r = requests.get(f"{PROXY_BASE}/v2/", verify=VERIFY)
     assert r.status_code == 200
+
+@pytest.mark.integration
+def test_ca_endpoint_available_and_valid():
+    """Teste que le /ca retourne un certificat PEM valide"""
+    r = requests.get(f"{PROXY_BASE}/ca", verify=False, timeout=5)
+    assert r.status_code == 200, f"/ca returned {r.status_code}"
+    assert b"-----BEGIN CERTIFICATE-----" in r.content, "Not a PEM format CA"
+    # Vérifie qu'on peut parser le certificat
+    try:
+        cert = x509.load_pem_x509_certificate(r.content, default_backend())
+        assert cert.subject is not None
+        print("CA Subject:", cert.subject)
+    except Exception as e:
+        pytest.fail(f"Invalid PEM certificate: {e}")
 
 @pytest.mark.integration
 def test_push_then_pull_busybox():

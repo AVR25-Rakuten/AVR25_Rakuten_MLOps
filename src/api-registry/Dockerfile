@@ -8,7 +8,7 @@ ARG APT_MIRROR=
 WORKDIR /app
 
 # ---- Variables d'env (proxy + health) ----
-ENV SERVICE_NAME="registry-nfq" \
+ENV SERVICE_NAME="api-registry" \
     APP_TLS="true" \
     LISTEN_HOST="0.0.0.0" \
     LISTEN_PORT="8000" \

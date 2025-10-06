@@ -11,7 +11,6 @@
 # cilium_phase2_routing_mode: "native"
 # cilium_tunnel_protocol: "vxlan"
 # cilium_nds_nodesel / cilium_nds_tolerations optionnels
-
 # -------------------------------------------------------------------
 # Préparation des variables TYPÉES (toujours exécuté)
 # -------------------------------------------------------------------
@@ -24,7 +23,6 @@
   tags:
     - always
     - cilium
-
 # -------------------------------------------------------------------
 # Dépôt Helm
 # -------------------------------------------------------------------
@@ -38,11 +36,9 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, helm]
-
 # -----------------------
 # Phase 1 — Bootstrap CNI (KPR=false + IPAM cluster-pool)
 # -----------------------
-
 - name: Build values for Phase 1 (no wait) - via api-registry
   set_fact:
     cilium_phase1_values:
@@ -58,7 +54,6 @@
         pullPolicy: "IfNotPresent"
         digest: "sha256:202e41af73c0b8b772d1847c67b4d3f7d13f075fae16fa4ad9f6edd553d4f6f4"
         useDigest: true
-
       envoy:
         image:
           override: ~
@@ -67,7 +62,6 @@
           pullPolicy: "IfNotPresent"
           digest: "sha256:b018cc3f6ef1fc6e9a4c7bda3ed559253289c947c087b9a30f9ef935400b57f1"
           useDigest: true
-
       operator:
         image:
           repository: "{{ nfq_proxy_host }}/quay.io/cilium/operator"
@@ -90,13 +84,11 @@
       hubble:
         enabled: false
   tags: [cilium, phase1]
-
 - name: Add tunnelProtocol for Phase 1 when routingMode=tunnel
   when: (cilium_phase1_routing_mode | default('tunnel')) == 'tunnel'
   set_fact:
     cilium_phase1_values: "{{ cilium_phase1_values | combine({'tunnelProtocol': cilium_tunnel_protocol | default('vxlan')}) }}"
   tags: [cilium, phase1]
-
 - name: Install/upgrade Cilium (phase 1 - bootstrap, no wait)
   kubernetes.core.helm:
     name: cilium
@@ -112,7 +104,6 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, phase1]
-
 # Guards “existence only” avec k8s_info
 - name: Wait until cilium-operator Deployment object exists (no readiness wait)
   kubernetes.core.k8s_info:
@@ -129,7 +120,6 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, phase1]
-
 - name: Wait until cilium DaemonSet object exists (no readiness wait)
   kubernetes.core.k8s_info:
     api_version: apps/v1
@@ -145,7 +135,6 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, phase1]
-
 # (Facultatif) Vérification non bloquante du prefix image => nfq_proxy_host
 - name: Debug images actually used (non-blocking)
   vars:
@@ -167,11 +156,29 @@
   delegate_to: "{{ groups['masters'][0] }}"
   become: false
   tags: [cilium, phase1, check]
-
+# Ajout de la tâche pour attendre que les pods soient prêts après la phase 1
+- name: Wait for all Cilium pods to be ready (Phase 1)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ kube_system_ns }}"
+    label_selectors:
+      - k8s-app=cilium
+  register: cilium_pods_phase1
+  until: >
+    cilium_pods_phase1.resources is defined and
+    (cilium_pods_phase1.resources | selectattr('status.phase', 'equalto', 'Running') | list | length == cilium_pods_phase1.resources | length) and
+    (cilium_pods_phase1.resources | map(attribute='status.containerStatuses') | flatten | selectattr('ready', 'defined') | selectattr('ready', 'equalto', true) | list | length == (cilium_pods_phase1.resources | map(attribute='status.containerStatuses') | flatten | list | length))
+  retries: 30
+  delay: 10
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase1]
 # -----------------------
 # Phase 2 — Activer KPR (kubeProxyReplacement=true + routage "native")
 # -----------------------
-
 - name: Build values for Phase 2 (KPR enable) - via api-registry
   when: cilium_enable_kpr | default(false) | bool
   set_fact:
@@ -196,7 +203,6 @@
       hubble:
         enabled: false
   tags: [cilium, phase2]
-
 - name: Add tunnelProtocol for Phase 2 when routingMode=tunnel
   when:
     - cilium_enable_kpr | default(false) | bool
@@ -204,7 +210,6 @@
   set_fact:
     cilium_phase2_values: "{{ cilium_phase2_values | combine({'tunnelProtocol': cilium_tunnel_protocol | default('vxlan')}) }}"
   tags: [cilium, phase2]
-
 - name: Enable kubeProxyReplacement (phase 2)
   when: cilium_enable_kpr | default(false) | bool
   kubernetes.core.helm:
@@ -220,7 +225,6 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, phase2]
-
 - name: Wait until updated resources exist (no readiness wait)
   when: cilium_enable_kpr | default(false) | bool
   kubernetes.core.k8s_info:
@@ -238,11 +242,30 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, phase2]
-
+# Ajout de la tâche pour attendre que les pods soient prêts après la phase 2
+- name: Wait for all Cilium pods to be ready (Phase 2)
+  when: cilium_enable_kpr | default(false) | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ kube_system_ns }}"
+    label_selectors:
+      - k8s-app=cilium
+  register: cilium_pods_phase2
+  until: >
+    cilium_pods_phase2.resources is defined and
+    (cilium_pods_phase2.resources | selectattr('status.phase', 'equalto', 'Running') | list | length == cilium_pods_phase2.resources | length) and
+    (cilium_pods_phase2.resources | map(attribute='status.containerStatuses') | flatten | selectattr('ready', 'defined') | selectattr('ready', 'equalto', true) | list | length == (cilium_pods_phase2.resources | map(attribute='status.containerStatuses') | flatten | list | length))
+  retries: 30
+  delay: 10
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase2]
 # -----------------------
 # Phase 3 — Hubble
 # -----------------------
-
 - name: Build base values for Phase 3 (Hubble enable) - via api-registry
   when: cilium_enable_hubble | default(false) | bool
   set_fact:
@@ -282,7 +305,6 @@
           nodeSelector: "{{ cilium_nds_nodesel }}"
           tolerations: "{{ cilium_nds_tolerations }}"
   tags: [cilium, phase3]
-
 - name: Phase 3 — IPAM when KPR enabled (kubernetes)
   when:
     - cilium_enable_hubble | default(false) | bool
@@ -290,7 +312,6 @@
   set_fact:
     cilium_phase3_values: "{{ cilium_phase3_values | combine({'ipam': {'mode': 'kubernetes'}}, recursive=True) }}"
   tags: [cilium, phase3]
-
 - name: Phase 3 — IPAM when KPR disabled (cluster-pool)
   when:
     - cilium_enable_hubble | default(false) | bool
@@ -306,7 +327,6 @@
         }
       }, recursive=True) }}"
   tags: [cilium, phase3]
-
 - name: Add tunnelProtocol for Phase 3 when routingMode=tunnel
   when:
     - cilium_enable_hubble | default(false) | bool
@@ -315,7 +335,6 @@
   set_fact:
     cilium_phase3_values: "{{ cilium_phase3_values | combine({'tunnelProtocol': cilium_tunnel_protocol | default('vxlan')}) }}"
   tags: [cilium, phase3]
-
 - name: Enable Hubble (phase 3)
   when: cilium_enable_hubble | default(false) | bool
   kubernetes.core.helm:
@@ -331,7 +350,27 @@
   become: yes
   environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
   tags: [cilium, phase3]
-
+# Ajout de la tâche pour attendre que les pods soient prêts après la phase 3
+- name: Wait for all Cilium pods to be ready (Phase 3)
+  when: cilium_enable_hubble | default(false) | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ kube_system_ns }}"
+    label_selectors:
+      - k8s-app=cilium
+  register: cilium_pods_phase3
+  until: >
+    cilium_pods_phase3.resources is defined and
+    (cilium_pods_phase3.resources | selectattr('status.phase', 'equalto', 'Running') | list | length == cilium_pods_phase3.resources | length) and
+    (cilium_pods_phase3.resources | map(attribute='status.containerStatuses') | flatten | selectattr('ready', 'defined') | selectattr('ready', 'equalto', true) | list | length == (cilium_pods_phase3.resources | map(attribute='status.containerStatuses') | flatten | list | length))
+  retries: 30
+  delay: 10
+  run_once: true
+  delegate_to: "{{ groups['masters'][0] }}"
+  become: yes
+  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+  tags: [cilium, phase3]
 # -----------------------
 # Debug non bloquant
 # -----------------------

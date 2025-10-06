@@ -191,91 +191,7 @@
       args:
         creates: /etc/containerd/config.toml
 
-    # # Configure containerd pour Kubernetes
-    # - name: Configure containerd for Kubernetes
-    #   copy:
-    #     dest: /etc/containerd/config.toml
-    #     content: |
-    #       version = 2
-    #       [plugins."io.containerd.runtime.v1.linux"]
-    #         [plugins."io.containerd.runtime.v1.linux".runtimes]
-    #           [plugins."io.containerd.runtime.v1.linux".runtimes.runc]
-    #             runtime_type = "io.containerd.runc.v2"
-    #       [plugins."io.containerd.grpc.v1.cri"]
-    #         disable = false
-    #         sandbox_image = "registry.k8s.io/pause:3.10.1"
-    #         [plugins."io.containerd.grpc.v1.cri".containerd]
-    #           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-    #             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-    #               runtime_type = "io.containerd.runc.v2"
-    #               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-    #                 SystemdCgroup = true
-    #         [plugins."io.containerd.grpc.v1.cri".registry]
-    #           [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-    #               endpoint = ["https://registry-1.docker.io"]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-    #               endpoint = ["https://registry.k8s.io"]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."192.168.200.1:5000"]
-    #               endpoint = ["http://192.168.200.1:5000"]
 
-    # # Configure containerd pour Kubernetes
-    # - name: Configure containerd for Kubernetes
-    #   copy:
-    #     dest: /etc/containerd/config.toml
-    #     content: |
-    #       version = 2
-
-    #       [plugins."io.containerd.grpc.v1.cri"]
-    #         disable = false
-    #         # IMPORTANT: image 'pause' via proxy
-    #         sandbox_image = "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}/registry.k8s.io/pause:3.10.1"
-
-    #         # Active la lecture des hosts.toml (par-registry)
-    #         [plugins."io.containerd.grpc.v1.cri".registry]
-    #           config_path = "/etc/containerd/certs.d"
-
-    #           [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-    #               endpoint = ["https://registry-1.docker.io"]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-    #               endpoint = ["https://registry.k8s.io"]
-    #             # (garde ou retire ce miroir HTTP local si tu l’utilises ailleurs)
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."{{ nfq_gateway_ip }}:{{ nfq_registry_port }}"]
-    #               endpoint = ["http://{{ nfq_gateway_ip }}:{{ nfq_registry_port }}"]
-
-    #         [plugins."io.containerd.grpc.v1.cri".containerd]
-    #           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-    #             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-    #               runtime_type = "io.containerd.runc.v2"
-    #               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-    #                 SystemdCgroup = true
-
-    # # Configure containerd pour Kubernetes
-    # - name: Configure containerd for Kubernetes
-    #   copy:
-    #     dest: /etc/containerd/config.toml
-    #     content: |
-    #       version = 2
-    #       [plugins."io.containerd.runtime.v1.linux"]
-    #         [plugins."io.containerd.runtime.v1.linux".runtimes]
-    #           [plugins."io.containerd.runtime.v1.linux".runtimes.runc]
-    #             runtime_type = "io.containerd.runc.v2"
-    #       [plugins."io.containerd.grpc.v1.cri"]
-    #         disable = false
-    #         sandbox_image = "{{ nfq_proxy_host }}/registry.k8s.io/pause:3.10.1"
-    #         [plugins."io.containerd.grpc.v1.cri".containerd]
-    #           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-    #             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-    #               runtime_type = "io.containerd.runc.v2"
-    #               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-    #                 SystemdCgroup = true
-    #         [plugins."io.containerd.grpc.v1.cri".registry]
-    #           [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-    #               endpoint = ["https://{{ nfq_proxy_host }}/registry-1.docker.io"]
-    #             [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-    #               endpoint = ["https://{{ nfq_proxy_host }}/registry.k8s.io"]
 
     - name: Configure containerd for Kubernetes
       copy:
@@ -285,10 +201,8 @@
 
           [plugins."io.containerd.grpc.v1.cri"]
             disable = false
-            # OK de garder le sandbox via proxy (voir plus bas pour aligner kubeadm)
             sandbox_image = "{{ nfq_proxy_host }}/registry.k8s.io/pause:3.10.1"
 
-            # ⚠️ INDISPENSABLE: active la lecture des /etc/containerd/certs.d/<registry>/hosts.toml
             [plugins."io.containerd.grpc.v1.cri".registry]
               config_path = "/etc/containerd/certs.d"
 
@@ -299,15 +213,35 @@
                   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
                     SystemdCgroup = true
 
-
-
     - name: Ensure certs.d dir for containerd proxy
       file:
         path: "/etc/containerd/certs.d/{{ nfq_proxy_host }}"
         state: directory
         mode: '0755'
 
-    - name: Configure hosts.toml for proxy (TLS skip verify)
+
+    - name: Fetch CA certificate from API registry
+      get_url:
+        url: "https://{{ nfq_proxy_host }}/ca"
+        dest: "/usr/local/share/ca-certificates/nfq-registry.crt"
+        mode: "0644"
+        validate_certs: false
+      register: ca_download
+      retries: 3
+      delay: 3
+      until: ca_download is succeeded
+
+    - name: Update CA certificates store
+      command: update-ca-certificates
+      register: ca_update
+      changed_when: >
+        ca_update.rc == 0 and
+        (ca_update.stdout is defined and
+        ('Adding' in ca_update.stdout or 'done' in ca_update.stdout))
+
+
+
+    - name: Configure hosts.toml for proxy with custom CA
       copy:
         dest: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/hosts.toml"
         mode: '0644'
@@ -315,7 +249,8 @@
           server = "https://{{ nfq_proxy_host }}"
           [host."https://{{ nfq_proxy_host }}"]
             capabilities = ["pull", "resolve"]
-            skip_verify = true
+            
+
 
 
 
@@ -507,6 +442,8 @@
     enabled: yes
     daemon_reload: yes
   tags: install
+
+
 
 # Initialisation du cluster
 - name: Initialize Kubernetes cluster
