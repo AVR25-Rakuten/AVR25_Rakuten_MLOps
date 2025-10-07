@@ -1,20 +1,21 @@
----
-# Tâche Ansible — Cilium en 3 phases : réseau d’abord, puis KPR, puis Hubble
-- name: Cilium — réseau d’abord, puis KPR, puis Hubble
+# Tâche Ansible — Cilium en 4 phases : réseau d’abord, puis KPR, puis Hubble, puis L2/LB-IPAM
+- name: Cilium — réseau d’abord, puis KPR, puis Hubble, puis L2/LB-IPAM
   vars:
     kube_system_ns: "kube-system"
     cilium_version: "1.18.2"
-    # nfq_proxy_host: "registry.local:5000"  # Spécifiez ici votre registre local
-    # (Optionnel) fichier values ; mettre use_values_file: true si vous en avez un
+    # nfq_proxy_host: "registry.local:5000"  # Décommentez si vous utilisez un miroir
     cilium_values_file: "/etc/cilium/values-selectors.yaml"
-    use_values_file: false  # passez à true si vous gérez un values.yaml
-    # Phase 2 : activer kube-proxy replacement et supprimer kube-proxy
+    use_values_file: false
     enable_kpr: true
     remove_kube_proxy: true
-    # Phase 3 : activer Hubble (relay + UI)
     enable_hubble: true
     enable_hubble_ui: true
-    # Définition des images pour éviter la répétition
+    # Plage LB-IPAM (exemple) — adaptez à votre réseau
+    lb_ipam_blocks:
+      - start: "192.168.200.100"
+        stop:  "192.168.200.120"
+    # Optionnel : forcer l’IP de Hubble UI (sinon allocation auto)
+    hubble_ui_lb_ip: ""
     cilium_images:
       cilium:
         repository: "{{ nfq_proxy_host }}/quay.io/cilium/cilium"
@@ -28,8 +29,7 @@
       hubble_ui:
         repository: "{{ nfq_proxy_host }}/quay.io/cilium/hubble-ui"
       hubble_ui_backend:
-        repository: "{{ nfq_proxy_host }}/quay.io/cilium/hubble-ui-backend"
-    # Configuration des nœuds réseau pour les pods non-DaemonSet
+        repository: "{{ nfq_proxy_host}}/quay.io/cilium/hubble-ui-backend"
     network_node_selector:
       "node-role.kubernetes.io/network": "true"
     network_tolerations:
@@ -41,6 +41,9 @@
         operator: "Exists"
         effect: "NoSchedule"
       - key: "node-role.kubernetes.io/data"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node.kubernetes.io/not-ready"
         operator: "Exists"
         effect: "NoSchedule"
   block:
@@ -57,6 +60,7 @@
       become: yes
       environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
       tags: [cilium]
+
     - name: Set facts for Cilium k8sServiceHost/Port
       set_fact:
         cilium_api_host: "{{ api_hostport.stdout.split(':')[0] }}"
@@ -65,6 +69,7 @@
       delegate_to: "{{ groups['masters'][0] }}"
       delegate_facts: true
       tags: [cilium]
+
     - name: Wait for Kubernetes API to be reachable
       command: kubectl --request-timeout=5s get --raw='/version'
       register: api_ping
@@ -77,8 +82,9 @@
       become: yes
       environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
       tags: [cilium]
+
     ###########################################################################
-    # 0.bis) FLAG HELM --values OPTIONNEL (seulement si le fichier existe)
+    # 0.bis) FLAG HELM --values OPTIONNEL
     ###########################################################################
     - name: Probe optional Cilium values file
       when: (use_values_file | default(false)) | bool
@@ -89,8 +95,9 @@
       delegate_to: "{{ groups['masters'][0] }}"
       become: yes
       tags: [cilium]
+
     ###########################################################################
-    # 1) INSTALL CILIUM (réseau d’abord, kube-proxy encore présent)
+    # 1) INSTALL CILIUM (réseau d’abord)
     ###########################################################################
     - name: Add Cilium Helm repo
       kubernetes.core.helm_repository:
@@ -102,6 +109,7 @@
       become: yes
       environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
       tags: [cilium]
+
     - name: Install/Upgrade Cilium (kube-proxy encore présent)
       kubernetes.core.helm:
         name: cilium
@@ -133,6 +141,7 @@
               nodeSelector: "{{ network_node_selector }}"
               tolerations: "{{ network_tolerations }}"
           kubeProxyReplacement: false
+          # IPAM Pods: éviter le fallback 10.0.0.0/8
           ipam:
             mode: cluster-pool
             operator:
@@ -144,6 +153,7 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     - name: Wait for cilium-agent DaemonSet to be Ready (phase 1)
       command: kubectl -n {{ kube_system_ns }} rollout status ds/cilium --timeout=600s
       changed_when: false
@@ -152,6 +162,7 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     - name: Wait for cilium-operator Deployment to be Ready (phase 1)
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/cilium-operator --timeout=600s
       changed_when: false
@@ -160,10 +171,11 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     ###########################################################################
-    # 2) BASCULE EN KPR (kube-proxy replacement)
+    # 2) BASCULE EN KPR + L2 announcements
     ###########################################################################
-    - name: Upgrade Cilium with kube-proxy replacement
+    - name: Upgrade Cilium with kube-proxy replacement + L2 announcements
       when: enable_kpr | bool
       kubernetes.core.helm:
         name: cilium
@@ -198,12 +210,19 @@
           k8sServicePort: "{{ hostvars[groups['masters'][0]].cilium_api_port }}"
           bpf:
             masquerade: true
+          l2announcements:
+            enabled: true
+          k8sClientRateLimit:
+            qps: 50
+            burst: 100
+          defaultLBServiceIPAM: "none"
       register: cilium_upgrade_kpr
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     - name: Wait for cilium-agent DaemonSet to be Ready (KPR)
       when: enable_kpr | bool
       command: kubectl -n {{ kube_system_ns }} rollout status ds/cilium --timeout=600s
@@ -213,6 +232,7 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     - name: Wait for cilium-operator Deployment to be Ready (KPR)
       when: enable_kpr | bool
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/cilium-operator --timeout=600s
@@ -222,6 +242,7 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     - name: Remove kube-proxy DaemonSet
       when: enable_kpr | bool and remove_kube_proxy | bool
       command: kubectl -n kube-system delete ds kube-proxy --ignore-not-found=true
@@ -230,6 +251,7 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
+
     - name: Remove kube-proxy ConfigMap (avoid re-install by kubeadm upgrade)
       when: enable_kpr | bool and remove_kube_proxy | bool
       command: kubectl -n kube-system delete cm kube-proxy --ignore-not-found=true
@@ -238,7 +260,7 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-    # (Optionnel) nettoyage iptables sur tous les nœuds après suppression de kube-proxy
+
     - name: Flush KUBE* iptables chains on all nodes (post kube-proxy removal)
       when: enable_kpr | bool and remove_kube_proxy | bool
       ansible.builtin.shell: |
@@ -248,10 +270,11 @@
         executable: /bin/bash
       become: yes
       tags: [cilium]
+
     ###########################################################################
-    # 3) HUBBLE (après réseau stable)
+    # 3) HUBBLE (en conservant KPR + L2 + LB-IPAM)
     ###########################################################################
-    - name: Enable Hubble Relay (reuse values)
+    - name: Enable Hubble Relay (keep KPR + L2 + IPAM values)
       when: enable_hubble | bool
       kubernetes.core.helm:
         name: cilium
@@ -276,17 +299,36 @@
               nodeSelector: "{{ network_node_selector }}"
               tolerations: "{{ network_tolerations }}"
             ui:
+              enabled: "{{ enable_hubble_ui | bool }}"
               image: "{{ cilium_images.hubble_ui }}"
               backend:
                 image: "{{ cilium_images.hubble_ui_backend }}"
               nodeSelector: "{{ network_node_selector }}"
               tolerations: "{{ network_tolerations }}"
+          kubeProxyReplacement: true
+          k8sServiceHost: "{{ hostvars[groups['masters'][0]].cilium_api_host }}"
+          k8sServicePort: "{{ hostvars[groups['masters'][0]].cilium_api_port }}"
+          bpf:
+            masquerade: true
+          l2announcements:
+            enabled: true
+          k8sClientRateLimit:
+            qps: 50
+            burst: 100
+          defaultLBServiceIPAM: "none"
+          # IPAM Pods (cohérent avec phase 1)
+          ipam:
+            mode: cluster-pool
+            operator:
+              clusterPoolIPv4PodCIDRList: "10.244.0.0/16"
+              clusterPoolIPv4MaskSize: 24
       register: hubble_relay_enable
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, hubble]
+
     - name: Wait for hubble-relay to be Ready
       when: enable_hubble | bool
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/hubble-relay --timeout=600s
@@ -296,44 +338,8 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, hubble]
-    - name: Optionally enable Hubble UI
-      when: enable_hubble | bool and enable_hubble_ui | bool
-      kubernetes.core.helm:
-        name: cilium
-        chart_ref: cilium/cilium
-        release_namespace: "{{ kube_system_ns }}"
-        chart_version: "{{ cilium_version }}"
-        wait: true
-        timeout: 10m
-        values_files: "{{ [cilium_values_file] if ((use_values_file | default(false)) | bool) and (cilium_values_stat.stat.exists | default(false)) else omit }}"
-        values:
-          image: "{{ cilium_images.cilium }}"
-          operator:
-            image: "{{ cilium_images.operator }}"
-            nodeSelector: "{{ network_node_selector }}"
-            tolerations: "{{ network_tolerations }}"
-          envoy:
-            image: "{{ cilium_images.envoy }}"
-          hubble:
-            relay:
-              enabled: true
-              image: "{{ cilium_images.hubble_relay }}"
-              nodeSelector: "{{ network_node_selector }}"
-              tolerations: "{{ network_tolerations }}"
-            ui:
-              enabled: true
-              image: "{{ cilium_images.hubble_ui }}"
-              backend:
-                image: "{{ cilium_images.hubble_ui_backend }}"
-              nodeSelector: "{{ network_node_selector }}"
-              tolerations: "{{ network_tolerations }}"
-      register: hubble_ui_enable
-      run_once: true
-      delegate_to: "{{ groups['masters'][0] }}"
-      become: yes
-      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-      tags: [cilium, hubble]
-    - name: Wait for hubble-ui to be Ready (if enabled)
+
+    - name: Ensure Hubble UI Deployment is Ready (if enabled)
       when: enable_hubble | bool and enable_hubble_ui | bool
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/hubble-ui --timeout=600s
       changed_when: false
@@ -342,5 +348,160 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, hubble]
+
+    ###########################################################################
+    # 4) L2 + LB-IPAM (pools, policy, Service LB Hubble UI)
+    ###########################################################################
+    - name: Define LB-IPAM pool(s)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: "cilium.io/v2"
+          kind: CiliumLoadBalancerIPPool
+          metadata:
+            name: "lb-pool"
+          spec:
+            blocks: "{{ lb_ipam_blocks }}"
+            # Lier explicitement au Service Hubble UI (labels + nom/namespace)
+            serviceSelector:
+              matchExpressions:
+                - key: expose
+                  operator: In
+                  values: ["l2"]
+                - key: io.kubernetes.service.namespace
+                  operator: In
+                  values: ["{{ kube_system_ns }}"]
+                - key: io.kubernetes.service.name
+                  operator: In
+                  values: ["hubble-ui-lb"]
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, l2]
+
+    - name: Create L2 Announcement policy
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: "cilium.io/v2alpha1"
+          kind: CiliumL2AnnouncementPolicy
+          metadata:
+            name: "l2-default"
+          spec:
+            nodeSelector:
+              matchLabels:
+                "node-role.kubernetes.io/network": "true"
+            interfaces:
+            - "^enp3s0"  # Remplacez par le nom de votre interface réseau
+            loadBalancerIPs: true
+            externalIPs: true   # décommentez si vous souhaitez annoncer des ExternalIPs
+            tolerations:
+              - key: "node-role.kubernetes.io/network"
+                operator: "Equal"
+                value: "true"
+                effect: "NoSchedule"
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+                effect: "NoSchedule"
+              - key: "node-role.kubernetes.io/data"
+                operator: "Exists"
+                effect: "NoSchedule"
+              - key: "node.kubernetes.io/not-ready"
+                operator: "Exists"
+                effect: "NoSchedule"
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, l2]
+
+    - name: Ensure hubble-ui Service exists
+      command: kubectl -n {{ kube_system_ns }} get svc hubble-ui
+      register: hubble_ui_svc_exists
+      retries: 30
+      delay: 5
+      until: hubble_ui_svc_exists.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, l2, hubble]
+
+    - name: Read hubble-ui Service JSON
+      command: kubectl -n {{ kube_system_ns }} get svc hubble-ui -o json
+      register: hubble_ui_svc_json
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, l2, hubble]
+
+    - name: Set fact with hubble-ui selector
+      set_fact:
+        hubble_ui_selector: "{{ (hubble_ui_svc_json.stdout | from_json).spec.selector }}"
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      tags: [cilium, l2, hubble]
+
+    - name: Create LoadBalancer Service for Hubble UI (via Cilium L2 announcer)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: hubble-ui-lb
+            namespace: "{{ kube_system_ns }}"
+            annotations: "{{ {'lbipam.cilium.io/ips': hubble_ui_lb_ip} if (hubble_ui_lb_ip | length) > 0 else {} }}"
+            labels:
+              app.kubernetes.io/part-of: "cilium"
+              app.kubernetes.io/name: "hubble-ui"
+              expose: "l2"
+          spec:
+            type: LoadBalancer
+            loadBalancerClass: io.cilium/l2-announcer
+            selector: "{{ hubble_ui_selector | default({'k8s-app':'hubble-ui'}) }}"
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8081
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, l2, hubble]
+
+    - name: Wait for hubble-ui-lb to get an external IP
+      shell: |
+        kubectl -n {{ kube_system_ns }} get svc hubble-ui-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: hubble_ui_lb_ip_alloc
+      retries: 60
+      delay: 5
+      until: hubble_ui_lb_ip_alloc.stdout != ""
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, l2, hubble]
+
+    ###########################################################################
+    # 5) ASSERTS (sanity checks utiles)
+    ###########################################################################
+    - name: Check L2 and KPR are enabled on agent
+      command: kubectl -n {{ kube_system_ns }} exec ds/cilium -c cilium-agent -- cilium-dbg config
+      register: cdbg
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      tags: [cilium, l2]
+
+    - name: Fail if L2 is disabled in agent
+      fail:
+        msg: "EnableL2Announcements is false après upgrade Helm — L2 non activé dans l'agent."
+      when: cdbg.stdout is search('EnableL2Announcements:\s*false')
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      tags: [cilium, l2]
   tags: [cilium]
   become: yes

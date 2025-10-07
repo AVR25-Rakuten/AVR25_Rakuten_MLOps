@@ -23,9 +23,9 @@
   include_tasks: kyverno.yml
   tags: kyverno
 
-- name: Include MetalLB tasks
-  include_tasks: metallb.yml
-  tags: metallb
+# - name: Include MetalLB tasks
+#   include_tasks: metallb.yml
+#   tags: metallb
 
 - name: Include CSI tasks
   include_tasks: mayastor.yml
