@@ -1,123 +1,163 @@
 # --- Kyverno (via Helm) ---
-- name: Ensure kyverno namespace
-  kubernetes.core.k8s:
-    state: present
-    definition:
-      apiVersion: v1
-      kind: Namespace
-      metadata: { name: "{{ kyverno_namespace }}" }
-  when: inventory_hostname == groups['masters'][0]
-  tags: kyverno
+- name: Configure Kyverno with proxy settings
+  vars:
+    kyverno_namespace: "kyverno"
+    kyverno_version: "3.5.2"  # Dernière version du chart Helm
+    nfq_gateway_ip: "192.168.200.1"
+    nfq_proxy_port: "8000"
+    nfq_proxy_host: "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}"
+    kyverno_install_policies: true
+    kyverno_mutate_prepend: true
+    kyverno_enforce: false  # Ajoutez cette ligne pour définir la variable
+    container_name: "kyverno"  # Nom du conteneur pour la politique de mutation
+  block:
+    - name: Ensure kyverno namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ kyverno_namespace }}"
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
 
-- name: Add Kyverno Helm repo
-  kubernetes.core.helm_repository:
-    name: kyverno
-    repo_url: https://kyverno.github.io/kyverno/
-  environment:
-    K8S_AUTH_KUBECONFIG: /root/.kube/config
-    KUBECONFIG: /root/.kube/config
-  when: inventory_hostname == groups['masters'][0]
-  tags: kyverno
+    - name: Add Kyverno Helm repo
+      kubernetes.core.helm_repository:
+        name: kyverno
+        repo_url: https://kyverno.github.io/kyverno/
+      environment:
+        K8S_AUTH_KUBECONFIG: /root/.kube/config
+        KUBECONFIG: /root/.kube/config
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
 
-- name: Install/upgrade Kyverno (images via notre proxy) - hostNetwork + tolerations (Option 2)
-  kubernetes.core.helm:
-    name: kyverno
-    chart_ref: kyverno/kyverno
-    release_namespace: "{{ kyverno_namespace }}"
-    wait: false              # pas de blocage tant que le CNI n'est pas là
-    atomic: false
-    create_namespace: false
-    chart_version: "{{ kyverno_version }}"
-    values:
-      installCRDs: true
-      global:
-        imageRegistry: "{{ nfq_proxy_host }}"   # ex: 192.168.200.1:8000
-      image:
-        repository: "ghcr.io/kyverno/kyverno"
-        # tag: "v1.12.0"  # (optionnel) si tu veux figer la version app
-      backgroundController:
-        image:
-          repository: "ghcr.io/kyverno/background-controller"
-        # Démarrer avant CNI: on tolère les taints master et on utilise le hostNetwork
-        tolerations:
-          - key: "node-role.kubernetes.io/control-plane"
-            operator: "Exists"
-            effect: "NoSchedule"
-          - key: "node-role.kubernetes.io/master"
-            operator: "Exists"
-            effect: "NoSchedule"
-        hostNetwork: true
-        dnsPolicy: ClusterFirstWithHostNet
-      reportsController:
-        image:
-          repository: "ghcr.io/kyverno/reports-controller"
-        tolerations:
-          - key: "node-role.kubernetes.io/control-plane"
-            operator: "Exists"
-            effect: "NoSchedule"
-          - key: "node-role.kubernetes.io/master"
-            operator: "Exists"
-            effect: "NoSchedule"
-        hostNetwork: true
-        dnsPolicy: ClusterFirstWithHostNet
-      admissionController:
-        # admission controller idem
-        tolerations:
-          - key: "node-role.kubernetes.io/control-plane"
-            operator: "Exists"
-            effect: "NoSchedule"
-          - key: "node-role.kubernetes.io/master"
-            operator: "Exists"
-            effect: "NoSchedule"
-        hostNetwork: true
-        dnsPolicy: ClusterFirstWithHostNet
-  environment:
-    K8S_AUTH_KUBECONFIG: /root/.kube/config
-    KUBECONFIG: /root/.kube/config
-  when: inventory_hostname == groups['masters'][0]
-  tags: kyverno
+    - name: Install/upgrade Kyverno (images via notre proxy) - hostNetwork + tolerations
+      kubernetes.core.helm:
+        name: kyverno
+        chart_ref: kyverno/kyverno
+        release_namespace: "{{ kyverno_namespace }}"
+        wait: false
+        atomic: false
+        create_namespace: false
+        chart_version: "{{ kyverno_version }}"
+        values:
+          installCRDs: true
+          global:
+            imageRegistry: "{{ nfq_proxy_host }}"
+          backgroundController:
+            tolerations:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+                effect: "NoSchedule"
+              - key: "node-role.kubernetes.io/master"
+                operator: "Exists"
+                effect: "NoSchedule"
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+          reportsController:
+            tolerations:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+                effect: "NoSchedule"
+              - key: "node-role.kubernetes.io/master"
+                operator: "Exists"
+                effect: "NoSchedule"
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+          admissionController:
+            tolerations:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+                effect: "NoSchedule"
+              - key: "node-role.kubernetes.io/master"
+                operator: "Exists"
+                effect: "NoSchedule"
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+          cleanupController:
+            tolerations:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+                effect: "NoSchedule"
+              - key: "node-role.kubernetes.io/master"
+                operator: "Exists"
+                effect: "NoSchedule"
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+      environment:
+        K8S_AUTH_KUBECONFIG: /root/.kube/config
+        KUBECONFIG: /root/.kube/config
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
 
-# Attendre uniquement l'enregistrement de la CRD (pas les Pods) pour pouvoir appliquer nos ClusterPolicy
-- name: Wait for Kyverno CRD clusterpolicies.kyverno.io to exist
-  kubernetes.core.k8s_info:
-    api_version: apiextensions.k8s.io/v1
-    kind: CustomResourceDefinition
-    name: clusterpolicies.kyverno.io
-  register: kyverno_crd
-  until: kyverno_crd.resources | length > 0
-  retries: 30
-  delay: 2
-  when: inventory_hostname == groups['masters'][0]
-  tags: kyverno
+    - name: Wait for Kyverno CRD clusterpolicies.kyverno.io to exist
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: clusterpolicies.kyverno.io
+      register: kyverno_crd
+      until: kyverno_crd.resources | length > 0
+      retries: 30
+      delay: 2
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
 
+    - name: Optionally install kyverno-policies bundle
+      when:
+        - kyverno_install_policies | bool
+        - inventory_hostname == groups['masters'][0]
+      kubernetes.core.helm:
+        name: kyverno-policies
+        chart_ref: kyverno/kyverno-policies
+        release_namespace: "{{ kyverno_namespace }}"
+        wait: false
+        values:
+          global:
+            imageRegistry: "{{ nfq_proxy_host }}"
+      environment:
+        K8S_AUTH_KUBECONFIG: /root/.kube/config
+        KUBECONFIG: /root/.kube/config
+      tags: kyverno
 
-- name: Optionally install kyverno-policies bundle
-  when:
-    - kyverno_install_policies | bool
-    - inventory_hostname == groups['masters'][0]
-  kubernetes.core.helm:
-    name: kyverno-policies
-    chart_ref: kyverno/kyverno-policies
-    release_namespace: "{{ kyverno_namespace }}"
-    wait: false
-  environment:
-    K8S_AUTH_KUBECONFIG: /root/.kube/config
-    KUBECONFIG: /root/.kube/config
-  tags: kyverno
+    - name: Apply ClusterPolicy restrict-image-registries
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', 'templates/policies/restrict-image-registries.yaml.j2') | from_yaml }}"
+      when:
+        - inventory_hostname == groups['masters'][0]
+        - kyverno_enforce | bool  # Utilisez la variable ici
+      tags: kyverno
 
-# Appliquer nos policies (CRDs maintenant présentes)
-- name: Apply ClusterPolicy restrict-image-registries (Audit/Enforce via var)
-  kubernetes.core.k8s:
-    state: present
-    definition: "{{ lookup('template', 'templates/policies/restrict-image-registries.yaml.j2') | from_yaml }}"
-  when: inventory_hostname == groups['masters'][0]
-  tags: kyverno
-
-- name: Apply ClusterPolicy prepend-image-registry (Mutation vers proxy)
-  when:
-    - kyverno_mutate_prepend | bool
-    - inventory_hostname == groups['masters'][0]
-  kubernetes.core.k8s:
-    state: present
-    definition: "{{ lookup('template', 'templates/policies/prepend-image-registry.yaml.j2') | from_yaml }}"
+    - name: Apply ClusterPolicy prepend-image-registry
+      when:
+        - kyverno_mutate_prepend | bool
+        - inventory_hostname == groups['masters'][0]
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
+          metadata:
+            name: prepend-image-registry
+            annotations:
+              policies.kyverno.io/title: Prepend Image Registry
+              policies.kyverno.io/category: Workload Management
+              policies.kyverno.io/minversion: 1.6.0
+              policies.kyverno.io/subject: Pod
+          spec:
+            background: true
+            rules:
+            - name: prepend-registry
+              match:
+                any:
+                - resources:
+                    kinds:
+                      - Pod
+              mutate:
+                patchStrategicMerge:
+                  spec:
+                    containers:
+                    - image: "{{ nfq_proxy_host }}/$(spec.containers[?(@.name == '{{ container_name }}')].image)"
+      tags: kyverno
   tags: kyverno
