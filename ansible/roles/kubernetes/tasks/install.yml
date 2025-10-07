@@ -220,24 +220,81 @@
         mode: '0755'
 
 
-    - name: Fetch CA certificate from API registry
+    # - name: Fetch CA certificate from API registry
+    #   get_url:
+    #     url: "https://{{ nfq_proxy_host }}/ca"
+    #     dest: "/usr/local/share/ca-certificates/nfq-registry.crt"
+    #     mode: "0644"
+    #     validate_certs: false
+    #   register: ca_download
+    #   retries: 3
+    #   delay: 3
+    #   until: ca_download is succeeded
+
+    # - name: Update CA certificates store
+    #   command: update-ca-certificates
+    #   register: ca_update
+    #   changed_when: >
+    #     ca_update.rc == 0 and
+    #     (ca_update.stdout is defined and
+    #     ('Adding' in ca_update.stdout or 'done' in ca_update.stdout))
+
+
+    - name: Define canonical CA path for the registry (single source of truth)
+      set_fact:
+        nfq_registry_ca_node_path: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/ca.crt"
+
+    - name: Fetch NFQ registry CA once into containerd certs.d
       get_url:
         url: "https://{{ nfq_proxy_host }}/ca"
-        dest: "/usr/local/share/ca-certificates/nfq-registry.crt"
+        dest: "{{ nfq_registry_ca_node_path }}"
         mode: "0644"
+        # On ne peut pas encore valider TLS tant que le CA n'est pas présent
         validate_certs: false
       register: ca_download
       retries: 3
       delay: 3
       until: ca_download is succeeded
 
-    - name: Update CA certificates store
+    - name: Verify the downloaded certificate is a real CA (BasicConstraints CA TRUE)
+      shell: |
+        set -e
+        openssl x509 -in {{ nfq_registry_ca_node_path }} -noout -text \
+          | awk '/Basic Constraints/{flag=1} flag && /CA:/{print; exit}'
+      register: ca_check
+      changed_when: false
+      failed_when: ca_check.rc != 0 or ('CA:TRUE' not in ca_check.stdout)
+
+    - name: Expose the same CA to the system trust via symlink (no duplication)
+      file:
+        src: "{{ nfq_registry_ca_node_path }}"
+        dest: "/usr/local/share/ca-certificates/nfq-registry.crt"
+        state: link
+        force: yes
+
+    - name: Update system CA certificates (idempotent changed_when)
       command: update-ca-certificates
       register: ca_update
       changed_when: >
-        ca_update.rc == 0 and
-        (ca_update.stdout is defined and
-        ('Adding' in ca_update.stdout or 'done' in ca_update.stdout))
+        'Adding' in (ca_update.stdout | default('')) or
+        'done'   in (ca_update.stdout | default(''))
+
+    - name: Configure hosts.toml for proxy with custom CA
+      copy:
+        dest: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/hosts.toml"
+        mode: '0644'
+        content: |
+          server = "https://{{ nfq_proxy_host }}"
+          [host."https://{{ nfq_proxy_host }}"]
+            capabilities = ["pull", "resolve"]
+            ca = "{{ nfq_registry_ca_node_path }}"
+
+
+    - name: Restart containerd to pick up CA changes
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
 
 
 

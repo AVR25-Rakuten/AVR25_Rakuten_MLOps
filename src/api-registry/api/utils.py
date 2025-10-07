@@ -18,7 +18,7 @@ UPSTREAM_REGISTRY = os.getenv("UPSTREAM_REGISTRY", "docker.io")
 INSECURE_SRC = os.getenv("INSECURE_SRC", "false").lower() in ("1", "true", "yes")
 INSECURE_DEST = os.getenv("INSECURE_DEST", "true").lower() in ("1", "true", "yes")
 
-# Mirroring: single-arch rapide par défaut, all-arch optionnel
+# Mirroring: single-arch rapide par défaut, all-arch optionnel (utilisé pour les copies par TAG)
 MIRROR_ALL_ARCHS = os.getenv("MIRROR_ALL_ARCHS", "false").lower() in ("1", "true", "yes")
 PLATFORM_OS = os.getenv("PLATFORM_OS", "linux")
 PLATFORM_ARCH = os.getenv("PLATFORM_ARCH", "").lower()   # "amd64", "arm64", ...
@@ -123,7 +123,7 @@ def _is_manifest_list_src(src_ref: str) -> bool:
         data = json.loads(raw)
         if isinstance(data, dict) and "manifests" in data:
             return True
-        mt = data.get("mediaType") or ""
+        mt = (data.get("mediaType") or "") if isinstance(data, dict) else ""
         return ("manifest.list" in mt) or ("image.index" in mt)
     except Exception:
         # fallback simple si pas JSON "propre"
@@ -167,36 +167,34 @@ def skopeo_inspect_digest(ref: str) -> str:
 async def local_has_manifest(reg: str, name: str, digest: str) -> bool:
     """
     Vérifie la présence locale (tampon) d’un manifest par digest.
+    On considère qu'un 200 suffit (certains registries ne renvoient pas toujours Docker-Content-Digest sur HEAD).
     """
     url = f"{REG_LOCAL_BASE_URL}/v2/{reg}/{name}/manifests/{digest}"
     async with httpx.AsyncClient(timeout=None) as client:
         r = await client.head(url, headers={"Accept": _MANIFEST_ACCEPT})
-    return r.status_code == 200 and bool(r.headers.get("Docker-Content-Digest"))
+    return r.status_code == 200
 
 def copy_to_local_digest(reg: str, name: str, digest: str) -> None:
     """
-    Copie une référence source par DIGEST vers le registry tampon **en TAG** (jamais en @sha).
-    - Si la source est un manifest list: copie --all (si MIRROR_ALL_ARCHS) ou force la plate-forme.
-    - Le tag destination est synthétique et dérivé du digest (stable/idempotent).
+    Copie une référence source par DIGEST vers le registry tampon **en TAG synthétique**,
+    en CONSERVANT EXACTEMENT les octets (=> même digest).
+    - Toujours `--preserve-digests` pour éviter toute conversion/réécriture.
+    - Toujours `--all` pour un index multi-arch (références enfants + blobs), afin d’éviter
+      les 404 ultérieurs lors de la sélection de plate-forme côté kubelet/containerd.
     """
     src_ref = _compose_upstream_digest(reg, name, digest)  # host/ns/name@sha256:...
     dest_tag = _synth_tag_from_digest(digest)
     src = f"docker://{src_ref}"
     dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}:{dest_tag}"
 
-    base = ["skopeo", "copy", "--retry-times", "3"] + _tls_flags(src=True, dest=True)
-    is_index = False
-    try:
-        is_index = _is_manifest_list_src(src_ref)
-    except Exception:
-        # Si on n'arrive pas à déterminer, on tente copie simple (puis fallback plate-forme au besoin)
-        is_index = False
-
-    if is_index:
-        cmd = base + _platform_overrides() + [src, dest]
-    else:
-        cmd = base + [src, dest]
-
+    cmd = [
+        "skopeo", "copy",
+        "--retry-times", "3",
+        "--preserve-digests",
+        "--all",
+        *_tls_flags(src=True, dest=True),
+        src, dest,
+    ]
     _run_skopeo(cmd)
 
 def copy_to_local_tag(reg: str, name: str, ref: str) -> None:
@@ -204,12 +202,18 @@ def copy_to_local_tag(reg: str, name: str, ref: str) -> None:
     Copie par TAG.
       - MIRROR_ALL_ARCHS=true  -> --all (manifest list + variantes)
       - sinon (défaut)         -> single-arch via --override-os/--override-arch[/--override-variant]
+    On garde `--preserve-digests` pour ne jamais réécrire les manifestes.
     """
     src_ref = _compose_upstream_tag(reg, name, ref)  # host/ns/name:tag
     src = f"docker://{src_ref}"
     dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}:{ref}"
 
-    base = ["skopeo", "copy", "--retry-times", "3"] + _tls_flags(src=True, dest=True)
+    base = [
+        "skopeo", "copy",
+        "--retry-times", "3",
+        "--preserve-digests",
+        *_tls_flags(src=True, dest=True),
+    ]
 
     # Détecte manifest list pour décider --all / overrides
     is_index = False
@@ -219,10 +223,16 @@ def copy_to_local_tag(reg: str, name: str, ref: str) -> None:
         is_index = False
 
     if is_index:
-        cmd = base + _platform_overrides() + [src, dest]
-    else:
+        # Si c'est un index : on recourt à la stratégie choisie (all ou plate-forme)
         if MIRROR_ALL_ARCHS:
             cmd = base + ["--all", src, dest]
+        else:
+            cmd = base + _platform_overrides() + [src, dest]
+    else:
+        # Manifest simple
+        if MIRROR_ALL_ARCHS:
+            # --all est inoffensif même si la source n'est pas une liste, mais on évite le warning
+            cmd = base + [src, dest]
         else:
             cmd = base + _platform_overrides() + [src, dest]
 

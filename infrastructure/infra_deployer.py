@@ -133,6 +133,13 @@ class InfraDeployer:
         for group in ['kvm', 'libvirt']:
             if group not in set(user_groups):
                 errors.append(f"L'utilisateur doit être dans le groupe '{group}' (sudo usermod -aG {group} $USER)")
+
+        # libvirtd actif
+        try:
+            run_command(['systemctl', 'is-active', 'libvirtd'], check=True)
+        except subprocess.CalledProcessError:
+            errors.append("Le service libvirtd n'est pas actif (sudo systemctl start libvirtd)")
+
         # Répertoires & droits
         for dir_path in [ISO_DIR, VM_IMAGES_DIR, CLOUD_INIT_ISO_DIR, SCRIPTS_DIR, FILES_DIR, OVMF_NVRAM_DIR]:
             if not os.path.exists(dir_path):
@@ -140,11 +147,7 @@ class InfraDeployer:
             else:
                 if not os.access(dir_path, os.W_OK):
                     errors.append(f"Permissions insuffisantes sur {dir_path} (sudo chown -R $USER:$USER {dir_path})")
-        # libvirtd actif
-        try:
-            run_command(['systemctl', 'is-active', 'libvirtd'], check=True)
-        except subprocess.CalledProcessError:
-            errors.append("Le service libvirtd n'est pas actif (sudo systemctl start libvirtd)")
+
         # Connexion libvirt
         try:
             self.conn = libvirt.open("qemu:///system")
