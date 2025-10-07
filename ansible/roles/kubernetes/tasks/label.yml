@@ -9,7 +9,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   changed_when: false
-  tags: label_nodes
+  tags: label
 
 # Applique les labels aux nœuds (uniquement s'ils existent dans le cluster)
 - name: Label master nodes
@@ -21,7 +21,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   when: item in k8s_nodes.stdout.split()
-  tags: label_nodes
+  tags: label
 
 - name: Label worker nodes
   command: kubectl label node {{ item }} node-role.kubernetes.io/worker=true --overwrite
@@ -32,7 +32,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   when: item in k8s_nodes.stdout.split()
-  tags: label_nodes
+  tags: label
 
 - name: Label data nodes
   command: kubectl label node {{ item }} node-role.kubernetes.io/data=true --overwrite
@@ -43,7 +43,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   when: item in k8s_nodes.stdout.split()
-  tags: label_nodes
+  tags: label
 
 - name: Label network nodes
   command: kubectl label node {{ item }} node-role.kubernetes.io/network=true --overwrite
@@ -54,6 +54,6 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   when: item in k8s_nodes.stdout.split()
-  tags: label_nodes
+  tags: label
 
   

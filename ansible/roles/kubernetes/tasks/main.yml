@@ -4,12 +4,12 @@
   tags: install
 
 - name: Include Label Nodes tasks
-  include_tasks: taint_nodes.yml
-  tags: taint_nodes
+  include_tasks: taint.yml
+  tags: taint
 
 - name: Include Label Nodes tasks
-  include_tasks: label_nodes.yml
-  tags: label_nodes
+  include_tasks: label.yml
+  tags: label
 
 - name: Include Helm tasks
   include_tasks: helm.yml
@@ -22,10 +22,6 @@
 - name: Include Helm tasks
   include_tasks: kyverno.yml
   tags: kyverno
-
-# - name: Include MetalLB tasks
-#   include_tasks: metallb.yml
-#   tags: metallb
 
 - name: Include CSI tasks
   include_tasks: mayastor.yml

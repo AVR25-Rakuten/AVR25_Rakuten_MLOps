@@ -9,7 +9,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   changed_when: false
-  tags: taint_nodes
+  tags: taint
 
 # Applique les taints aux nœuds réseau (uniquement s'ils existent dans le cluster)
 - name: Taint network nodes
@@ -21,7 +21,7 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   when: item in k8s_nodes.stdout.split()
-  tags: taint_nodes
+  tags: taint
 
 
 # Applique les taints aux nœuds data (optionnel, selon vos besoins)
@@ -34,4 +34,4 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   when: item in k8s_nodes.stdout.split()
-  tags: taint_nodes
+  tags: taint
