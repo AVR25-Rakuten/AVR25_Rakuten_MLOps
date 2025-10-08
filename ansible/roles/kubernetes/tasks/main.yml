@@ -3,7 +3,7 @@
   include_tasks: install.yml
   tags: install
 
-- name: Include Label Nodes tasks
+- name: Include Taint Nodes tasks
   include_tasks: taint.yml
   tags: taint
 
@@ -15,13 +15,13 @@
   include_tasks: helm.yml
   tags: helm
 
-- name: Include CNI tasks
-  include_tasks: cilium.yml
-  tags: cilium
-
 - name: Include Helm tasks
   include_tasks: kyverno.yml
   tags: kyverno
+
+- name: Include CNI tasks
+  include_tasks: cilium.yml
+  tags: cilium
 
 - name: Include CSI tasks
   include_tasks: mayastor.yml

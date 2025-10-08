@@ -8,9 +8,24 @@
     nfq_proxy_host: "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}"
     kyverno_install_policies: true
     kyverno_mutate_prepend: true
-    kyverno_enforce: false  # Ajoutez cette ligne pour définir la variable
-    container_name: "kyverno"  # Nom du conteneur pour la politique de mutation
+    kyverno_enforce: false
+    container_name: "kyverno"
+    # Sélecteur pour cibler les nœuds masters (utilise le label master=true présent sur tous)
+    kyverno_node_selector:
+      "node-role.kubernetes.io/master": "true"
+    # Tolérations pour les nœuds masters et NotReady
+    kyverno_tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
   block:
+    # --- Namespace Kyverno ---
     - name: Ensure kyverno namespace
       kubernetes.core.k8s:
         state: present
@@ -22,6 +37,7 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
+    # --- Helm repo ---
     - name: Add Kyverno Helm repo
       kubernetes.core.helm_repository:
         name: kyverno
@@ -32,7 +48,8 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
-    - name: Install/upgrade Kyverno (images via notre proxy) - hostNetwork + tolerations
+    # --- Installation Kyverno (sur les masters uniquement) ---
+    - name: Install/upgrade Kyverno (with proxy + hostNetwork + nodeSelector + tolerations)
       kubernetes.core.helm:
         name: kyverno
         chart_ref: kyverno/kyverno
@@ -45,52 +62,45 @@
           installCRDs: true
           global:
             imageRegistry: "{{ nfq_proxy_host }}"
+          # Configuration commune à tous les composants
+          nodeSelector: "{{ kyverno_node_selector }}"
+          tolerations: "{{ kyverno_tolerations }}"
+          # Configuration spécifique par composant
           backgroundController:
-            tolerations:
-              - key: "node-role.kubernetes.io/control-plane"
-                operator: "Exists"
-                effect: "NoSchedule"
-              - key: "node-role.kubernetes.io/master"
-                operator: "Exists"
-                effect: "NoSchedule"
             hostNetwork: true
             dnsPolicy: ClusterFirstWithHostNet
-          reportsController:
-            tolerations:
-              - key: "node-role.kubernetes.io/control-plane"
-                operator: "Exists"
-                effect: "NoSchedule"
-              - key: "node-role.kubernetes.io/master"
-                operator: "Exists"
-                effect: "NoSchedule"
-            hostNetwork: true
-            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector: "{{ kyverno_node_selector }}"
+            tolerations: "{{ kyverno_tolerations }}"
           admissionController:
-            tolerations:
-              - key: "node-role.kubernetes.io/control-plane"
-                operator: "Exists"
-                effect: "NoSchedule"
-              - key: "node-role.kubernetes.io/master"
-                operator: "Exists"
-                effect: "NoSchedule"
             hostNetwork: true
             dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector: "{{ kyverno_node_selector }}"
+            tolerations: "{{ kyverno_tolerations }}"
+          reportsController:
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            tolerations: "{{ kyverno_tolerations }}"
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
           cleanupController:
-            tolerations:
-              - key: "node-role.kubernetes.io/control-plane"
-                operator: "Exists"
-                effect: "NoSchedule"
-              - key: "node-role.kubernetes.io/master"
-                operator: "Exists"
-                effect: "NoSchedule"
             hostNetwork: true
             dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector: "{{ kyverno_node_selector }}"
+            tolerations: "{{ kyverno_tolerations }}"
+          # Configuration pour migrate-resources (daemonset)
+          migrateResources:
+            enabled: true
+            tolerations: "{{ kyverno_tolerations }}"
+            nodeSelector: "{{ kyverno_node_selector }}"
       environment:
         K8S_AUTH_KUBECONFIG: /root/.kube/config
         KUBECONFIG: /root/.kube/config
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
+    # --- Attente des CRDs ---
     - name: Wait for Kyverno CRD clusterpolicies.kyverno.io to exist
       kubernetes.core.k8s_info:
         api_version: apiextensions.k8s.io/v1
@@ -103,6 +113,7 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
+    # --- Kyverno Policies Bundle (sur les masters uniquement) ---
     - name: Optionally install kyverno-policies bundle
       when:
         - kyverno_install_policies | bool
@@ -115,49 +126,60 @@
         values:
           global:
             imageRegistry: "{{ nfq_proxy_host }}"
+          nodeSelector: "{{ kyverno_node_selector }}"
+          tolerations: "{{ kyverno_tolerations }}"
       environment:
         K8S_AUTH_KUBECONFIG: /root/.kube/config
         KUBECONFIG: /root/.kube/config
       tags: kyverno
 
+    # --- Policy: Restrict Image Registries ---
     - name: Apply ClusterPolicy restrict-image-registries
       kubernetes.core.k8s:
         state: present
         definition: "{{ lookup('template', 'templates/policies/restrict-image-registries.yaml.j2') | from_yaml }}"
       when:
         - inventory_hostname == groups['masters'][0]
-        - kyverno_enforce | bool  # Utilisez la variable ici
+        - kyverno_enforce | bool
       tags: kyverno
 
-    - name: Apply ClusterPolicy prepend-image-registry
+    # --- Policy: Prepend Image Registry (safe version) ---
+    - name: Apply ClusterPolicy prepend-image-registry (safe merge)
       when:
         - kyverno_mutate_prepend | bool
         - inventory_hostname == groups['masters'][0]
       kubernetes.core.k8s:
         state: present
+        definition: "{{ lookup('template', 'templates/policies/prepend-image-registry.yaml.j2') | from_yaml }}"
+      tags: kyverno
+
+    # --- PolicyException: Allow Kyverno to use hostNetwork / hostPorts ---
+    - name: Apply PolicyException to allow Kyverno hostNetwork and hostPorts
+      kubernetes.core.k8s:
+        state: present
         definition:
-          apiVersion: kyverno.io/v1
-          kind: ClusterPolicy
+          apiVersion: kyverno.io/v2
+          kind: PolicyException
           metadata:
-            name: prepend-image-registry
-            annotations:
-              policies.kyverno.io/title: Prepend Image Registry
-              policies.kyverno.io/category: Workload Management
-              policies.kyverno.io/minversion: 1.6.0
-              policies.kyverno.io/subject: Pod
+            name: allow-kyverno-self-hostnetwork
+            namespace: "{{ kyverno_namespace }}"
           spec:
-            background: true
-            rules:
-            - name: prepend-registry
-              match:
-                any:
+            match:
+              any:
                 - resources:
-                    kinds:
-                      - Pod
-              mutate:
-                patchStrategicMerge:
-                  spec:
-                    containers:
-                    - image: "{{ nfq_proxy_host }}/$(spec.containers[?(@.name == '{{ container_name }}')].image)"
+                    namespaces:
+                      - "{{ kyverno_namespace }}"
+            exceptions:
+              - policyName: disallow-host-namespaces
+                ruleNames:
+                  - "*"
+                  - autogen-host-namespaces
+                  - host-namespaces
+              - policyName: disallow-host-ports
+                ruleNames:
+                  - "*"
+                  - autogen-host-ports
+                  - host-ports-none
+      when: inventory_hostname == groups['masters'][0]
       tags: kyverno
   tags: kyverno

@@ -31,20 +31,36 @@ systemd_cgroup: true
 # Configuration CRI
 cri_socket: "unix:///var/run/containerd/containerd.sock"
 
-# Configuration Cilium
-cilium_version: "1.18.2"
-enable_hubble: true
-enable_hubble_ui: true
-
-
 nfq_gateway_ip: "192.168.200.1"
 nfq_proxy_port: 8000           # FastAPI TLS (ton proxy)
 nfq_registry_port: 5000        # Tampon registry (registry:2) HTTP
 nfq_proxy_host: "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}"
 
-# Kyverno
-kyverno_namespace: kyverno
-kyverno_version: "~3.2.0"
-kyverno_enforce: false           # start in Audit to avoid regressions
-kyverno_install_policies: false  # optionnel
-kyverno_mutate_prepend: true     # ✅ on active la mutation pour réécrire toutes les images
+
+
+# ================================================================
+# Cilium — 3 phases : Réseau d’abord, puis KPR, puis Hubble
+# Style "modules Ansible" + images via proxy/registry
+# ================================================================
+# -----------------------
+# Variables attendues (exemples)
+# -----------------------
+cilium_version: "1.18.2"
+kube_system_ns: "kube-system"
+pod_cidr_v4: "10.244.0.0/16"
+pool_mask_v4: 24
+use_values_file: false
+# cilium_values_file: "/etc/cilium/values-selectors.yaml"
+# nfq_proxy_host: "registry.local:5000"    # <-- où chercher les images (prefix)
+cilium_enable_kpr: true
+cilium_remove_kube_proxy: true
+cilium_enable_hubble: true
+cilium_enable_hubble_ui: true
+cilium_phase1_routing_mode: "tunnel"
+cilium_phase2_routing_mode: "native"
+cilium_tunnel_protocol: "vxlan"
+cilium_nds_nodesel: { "node-role.kubernetes.io/network": "true" }
+cilium_nds_tolerations:
+  - { key: "node-role.kubernetes.io/network", operator: "Equal", value: "true", effect: "NoSchedule" }
+  # - { key: "node-role.kubernetes.io/control-plane", operator: "Exists", effect: "NoSchedule" }
+  # - { key: "node-role.kubernetes.io/data", operator: "Exists", effect: "NoSchedule" }

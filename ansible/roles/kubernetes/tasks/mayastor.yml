@@ -1,271 +1,263 @@
----
-# Variables attendues (exemples dans group_vars/all.yml)
-# mayastor_namespace: "openebs"
-# nfq_proxy_host: "192.168.200.1:8000"
-# mayastor_chart_version: "3.10.0"   # (optionnel) version du chart openebs/openebs
-# data_node_group: "datas"
-# mayastor_disk_device_default: "/dev/nvme0n2"
-# taint_data_nodes: true
-# set_default_sc: true
-# default_sc_name: "mayastor-3"
-
-# --- Prérequis OS sur les nœuds data (identique à avant) ---
-- name: Vérifier le kernel >= 5.13
-  shell: |
-    cur=$(uname -r | cut -d- -f1)
-    printf "5.13\n%s\n" "$cur" | sort -C -V
-  register: kernelchk
-  failed_when: kernelchk.rc != 0
-  changed_when: false
-  when: inventory_hostname in groups[data_node_group]
-  tags: [mayastor]
-
-- name: Installer nvme-cli
-  package:
-    name: nvme-cli
-    state: present
-  when: inventory_hostname in groups[data_node_group]
-  tags: [mayastor]
-
-- name: Charger le module nvme_tcp
-  modprobe:
-    name: nvme_tcp
-    state: present
-  when: inventory_hostname in groups[data_node_group]
-  tags: [mayastor]
-
-- name: Persister nvme_tcp au boot
-  copy:
-    dest: /etc/modules-load.d/nvme_tcp.conf
-    content: "nvme_tcp\n"
-    mode: "0644"
-  when: inventory_hostname in groups[data_node_group]
-  tags: [mayastor]
-
-- name: Configurer HugePages
-  sysctl:
-    name: vm.nr_hugepages
-    value: "2048"
-    sysctl_set: true
-    reload: true
-  when: inventory_hostname in groups[data_node_group]
-  tags: [mayastor]
-
-- name: Labeliser les nœuds data
-  command: kubectl label node {{ inventory_hostname }} {{ item.key }}={{ item.value }} --overwrite
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  register: label_result
-  changed_when: "'labeled' in (label_result.stdout + label_result.stderr) or 'configured' in (label_result.stdout + label_result.stderr)"
-  loop:
-    - { key: "openebs.io/engine",  value: "mayastor" }
-    - { key: "openebs.io/csi-node", value: "mayastor" }
-    - { key: "openebs.io/storage", value: "mayastor" }
-  when: inventory_hostname in groups[data_node_group]
-  delegate_to: "{{ groups['masters'][0] }}"
-  tags: [mayastor]
-
-- name: Tainter les nœuds data
-  command: kubectl taint nodes {{ inventory_hostname }} openebs.io/storage=mayastor:NoSchedule --overwrite
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  register: taint_out
-  changed_when: "'tainted' in (taint_out.stdout + taint_out.stderr) or 'already has' in (taint_out.stdout + taint_out.stderr)"
-  when:
-    - taint_data_nodes | default(true) | bool
-    - inventory_hostname in groups[data_node_group]
-  delegate_to: "{{ groups['masters'][0] }}"
-  tags: [mayastor]
-
-# --- Namespace & repo Helm ---
-- name: Ensure namespace {{ mayastor_namespace }}
-  kubernetes.core.k8s:
-    state: present
-    definition:
-      apiVersion: v1
-      kind: Namespace
-      metadata: { name: "{{ mayastor_namespace }}" }
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, helm]
-
-- name: Add OpenEBS Helm repo
-  kubernetes.core.helm_repository:
-    name: openebs
-    repo_url: https://openebs.github.io/openebs
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, helm]
-
-# --- Install/upgrade OpenEBS (Mayastor enabled, autres composants off) ---
-- name: Install/upgrade OpenEBS with Mayastor (via proxy)
-  kubernetes.core.helm:
-    name: openebs
-    chart_ref: openebs/openebs
-    release_namespace: "{{ mayastor_namespace }}"
-    chart_version: "{{ mayastor_chart_version | default(omit) }}"
-    create_namespace: false
-    wait: false        # ne bloque pas tant que le CNI n'est pas up
-    atomic: false
-    values:
-      # ✅ Tout via le proxy/tampon (si le chart ignore, Kyverno préprépendera)
-      global:
-        imageRegistry: "{{ nfq_proxy_host }}"
-
-      # ✅ Activer Mayastor, désactiver les autres moteurs/composants
-      engines:
-        local:
-          lvm:
-            enabled: false
-          zfs:
-            enabled: false
-        replicated:
-          mayastor:
-            enabled: true
-
-      localpv-provisioner: { enabled: false }
-      minio:              { enabled: false }
-      openebs-api:        { enabled: false }
-      ndm:                { enabled: false }
-      ndm-operator:       { enabled: false }
-
-      # ✅ Tolerations & topologie CSI (selon ton ancien values)
-      mayastor:
-        tolerations:
-          - key: "openebs.io/storage"
-            operator: "Equal"
-            value: "mayastor"
-            effect: "NoSchedule"
-        csi:
-          node:
-            topology:
-              nodeSelector: true
-              segments:
-                openebs.io/csi-node: mayastor
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, helm]
-
-# --- Attendre la présence des CRDs Mayastor avant d'appliquer DiskPools ---
-- name: Wait for DiskPool CRD to exist
-  shell: kubectl get crd diskpools.openebs.io
-  register: crd
-  retries: 60
-  delay: 5
-  until: crd.rc == 0
-  changed_when: false
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, crd]
-
-# --- Appliquer les DiskPools à partir de l'inventaire ---
-- name: Apply DiskPool CRs for data nodes
+# Variables pour Mayastor
+- name: Configure Mayastor storage
   vars:
-    target_dev: "{{ hostvars[item].mayastor_disk_device | default(mayastor_disk_device_default) }}"
-  kubernetes.core.k8s:
-    state: present
-    definition:
-      apiVersion: openebs.io/v1beta3
-      kind: DiskPool
-      metadata:
-        name: "pool-{{ item }}"
-        namespace: "{{ mayastor_namespace }}"
-      spec:
-        node: "{{ item }}"
-        disks:
-          - "{{ target_dev }}"
-  loop: "{{ groups[data_node_group] | default([]) }}"
-  when: groups[data_node_group] is defined and groups[data_node_group] | length > 0
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, pools]
-
-# --- StorageClasses (1 réplica et 3 réplicas) ---
-- name: Apply StorageClasses (mayastor-1 / mayastor-3)
-  kubernetes.core.k8s:
-    state: present
-    definition:
-      apiVersion: storage.k8s.io/v1
-      kind: StorageClass
-      metadata:
-        name: mayastor-1
-      provisioner: io.openebs.csi-mayastor
-      allowVolumeExpansion: true
-      volumeBindingMode: WaitForFirstConsumer
-      parameters:
-        protocol: nvmf
-        repl: "1"
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, sc]
-
-- name: Apply StorageClass mayastor-3 (thin, repl=3)
-  kubernetes.core.k8s:
-    state: present
-    definition:
-      apiVersion: storage.k8s.io/v1
-      kind: StorageClass
-      metadata:
-        name: mayastor-3
-      provisioner: io.openebs.csi-mayastor
-      allowVolumeExpansion: true
-      volumeBindingMode: WaitForFirstConsumer
-      parameters:
-        protocol: nvmf
-        repl: "3"
-        thin: "true"
-        ioTimeout: "30"
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, sc]
-
-# --- Définir la StorageClass par défaut ---
-- name: Set default StorageClass (unset others)
-  when: set_default_sc | default(true) | bool
+    mayastor_namespace: "openebs"
+    mayastor_chart_version: "4.3.3"
+    data_node_group: "datas"                 # groupe Ansible de tes nœuds storage
+    mayastor_disk_device_default: "/dev/nvme0n2"
   block:
-    - name: Unset default annotation on all other SCs
+    # --- Nettoyage des ressources existantes ---
+    - name: Nettoyer les ressources Mayastor existantes
+      block:
+        - name: Supprimer la release Helm Mayastor
+          command: helm uninstall mayastor -n {{ mayastor_namespace }}
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+          ignore_errors: yes
+          tags: [mayastor, cleanup]
+
+        - name: Supprimer le namespace OpenEBS
+          kubernetes.core.k8s:
+            state: absent
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata: { name: "{{ mayastor_namespace }}" }
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+          ignore_errors: yes
+          tags: [mayastor, cleanup]
+
+        - name: Supprimer le dépôt Helm OpenEBS
+          command: helm repo remove openebs
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          ignore_errors: yes
+          tags: [mayastor, cleanup]
+      tags: [mayastor, cleanup]
+
+    # --- Prérequis OS sur les nœuds data ---
+    - name: Vérifier le kernel >= 5.13
       shell: |
-        set -e
-        for sc in $(kubectl get sc -o jsonpath='{.items[*].metadata.name}'); do
-          if [ "$sc" != "{{ default_sc_name }}" ]; then
-            kubectl annotate sc "$sc" storageclass.kubernetes.io/is-default-class- || true
-          fi
-        done
+        cur=$(uname -r | cut -d- -f1)
+        printf "5.13\n%s\n" "$cur" | sort -C -V
+      register: kernelchk
+      failed_when: kernelchk.rc != 0
+      changed_when: false
+      when: inventory_hostname in groups[data_node_group]
+      tags: [mayastor]
+
+    - name: Installer nvme-cli
+      package:
+        name: nvme-cli
+        state: present
+      when: inventory_hostname in groups[data_node_group]
+      tags: [mayastor]
+
+    - name: Charger le module nvme_tcp
+      modprobe:
+        name: nvme_tcp
+        state: present
+      when: inventory_hostname in groups[data_node_group]
+      tags: [mayastor]
+
+    - name: Persister nvme_tcp au boot
+      copy:
+        dest: /etc/modules-load.d/nvme_tcp.conf
+        content: "nvme_tcp\n"
+        mode: "0644"
+      when: inventory_hostname in groups[data_node_group]
+      tags: [mayastor]
+
+    - name: Configurer HugePages (2MiB x 2048 = 4GiB réservés)
+      sysctl:
+        name: vm.nr_hugepages
+        value: "2048"
+        sysctl_set: true
+        reload: true
+      when: inventory_hostname in groups[data_node_group]
+      tags: [mayastor]
+
+    # --- Labels OpenEBS sur les nœuds data (en plus de tes labels/taints existants) ---
+    - name: Labeliser les nœuds data pour OpenEBS/Mayastor
+      command: kubectl label node {{ item }} openebs.io/engine=mayastor openebs.io/csi-node=mayastor openebs.io/storage=mayastor --overwrite
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      loop: "{{ groups[data_node_group] | default([]) }}"
+      when: groups[data_node_group] is defined
+      delegate_to: "{{ groups['masters'][0] }}"
+      run_once: true
+      tags: [mayastor]
+
+    # --- Namespace & repo Helm ---
+    - name: Ensure namespace {{ mayastor_namespace }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata: { name: "{{ mayastor_namespace }}" }
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [mayastor, helm]
 
-    - name: Set default annotation on {{ default_sc_name }}
-      command: kubectl annotate sc {{ default_sc_name }} storageclass.kubernetes.io/is-default-class="true" --overwrite
-      register: annotate_out
-      changed_when: "'annotated' in (annotate_out.stdout | default('')) or 'annotated' in (annotate_out.stderr | default(''))"
+    - name: Add OpenEBS Helm repo (v4+)
+      kubernetes.core.helm_repository:
+        name: openebs
+        repo_url: https://openebs.github.io/openebs
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, sc]
+      tags: [mayastor, helm]
 
-# --- Debug non bloquant ---
-- name: List OpenEBS pods (debug)
-  command: kubectl -n {{ mayastor_namespace }} get pods -o wide
-  register: openebs_pods
-  changed_when: false
-  failed_when: false
-  run_once: true
-  delegate_to: "{{ groups['masters'][0] }}"
-  become: yes
-  environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-  tags: [mayastor, check]
+    - name: Mettre à jour le dépôt Helm
+      command: helm repo update
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [mayastor, helm]
+
+    - name: Désactiver temporairement Kyverno
+      command: kubectl delete validatingwebhookconfigurations kyverno-policy-validating-webhook-cfg mutatingwebhookconfigurations kyverno-policy-mutating-webhook-cfg --ignore-not-found
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [mayastor, helm]
+
+    - name: Construire les valeurs OpenEBS/Mayastor (4.3.3, option A)
+      set_fact:
+        openebs_values:
+          # Observability off (sinon DS openebs-alloy et Loki)
+          alloy:
+            enabled: false
+          loki:
+            enabled: false
+          # Moteurs locaux non utilisés
+          engines:
+            local:
+              lvm:
+                enabled: false
+              zfs:
+                enabled: false
+            replicated:
+              mayastor:
+                enabled: true
+          # Mayastor : topologie + tolerations pour tes nœuds data taintés
+          mayastor:
+            csi:
+              node:
+                topology:
+                  nodeSelector: true
+                  segments:
+                    openebs.io/csi-node: "mayastor"
+                tolerations:
+                  - key: "node-role.kubernetes.io/data"
+                    operator: "Equal"
+                    value: "true"
+                    effect: "NoSchedule"
+            io_engine:
+              tolerations:
+                - key: "node-role.kubernetes.io/data"
+                  operator: "Equal"
+                  value: "true"
+                  effect: "NoSchedule"
+            agents:
+              ha:
+                enabled: true
+                node:
+                  logLevel: "info"
+                  resources:
+                    limits:
+                      cpu: "500m"
+                      memory: "512Mi"
+                    requests:
+                      cpu: "100m"
+                      memory: "128Mi"
+              core:
+                tolerations:
+                  - key: "node-role.kubernetes.io/data"
+                    operator: "Equal"
+                    value: "true"
+                    effect: "NoSchedule"
+              ha:
+                node:
+                  tolerations:
+                    - key: "node-role.kubernetes.io/data"
+                      operator: "Equal"
+                      value: "true"
+                      effect: "NoSchedule"
+                cluster:
+                  tolerations:
+                    - key: "node-role.kubernetes.io/data"
+                      operator: "Equal"
+                      value: "true"
+                      effect: "NoSchedule"
+      tags: [mayastor, helm]
+
+    # --- Générer les fichiers de configuration ---
+    - name: Créer le répertoire pour les fichiers générés
+      file:
+        path: "/tmp/mayastor-manifests"
+        state: directory
+        mode: "0755"
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      tags: [mayastor, generate]
+
+    - name: Créer un fichier temporaire pour les valeurs YAML
+      copy:
+        dest: "/tmp/mayastor-values.yaml"
+        content: |
+          {{ openebs_values | to_nice_yaml }}
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      tags: [mayastor, generate]
+
+    - name: Générer les fichiers de configuration avec Helm template
+      shell: helm template mayastor openebs/openebs --version {{ mayastor_chart_version }} --namespace {{ mayastor_namespace }} -f /tmp/mayastor-values.yaml > /tmp/mayastor-manifests/mayastor.yaml
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [mayastor, generate]
+
+    - name: Vérifier si le fichier est généré
+      stat:
+        path: "/tmp/mayastor-manifests/mayastor.yaml"
+      register: file_stat
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      tags: [mayastor, generate]
+
+    - name: Afficher le statut du fichier
+      debug:
+        var: file_stat
+      tags: [mayastor, generate]
+
+    - name: Afficher le contenu des fichiers générés
+      command: ls /tmp/mayastor-manifests/mayastor.yaml
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      register: generated_manifests
+      changed_when: false
+      tags: [mayastor, generate]
+
+    # - name: Afficher les fichiers générés
+    #   debug:
+    #     var: generated_manifests.stdout_lines
+    #   when: file_stat.stat.exists
+    #   tags: [mayastor, generate]
+  tags: [mayastor]

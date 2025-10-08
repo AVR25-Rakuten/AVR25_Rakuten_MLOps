@@ -64,3 +64,6 @@ cilium_nds_tolerations:
   - { key: "node-role.kubernetes.io/network", operator: "Equal", value: "true", effect: "NoSchedule" }
   # - { key: "node-role.kubernetes.io/control-plane", operator: "Exists", effect: "NoSchedule" }
   # - { key: "node-role.kubernetes.io/data", operator: "Exists", effect: "NoSchedule" }
+
+
+

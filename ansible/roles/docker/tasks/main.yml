@@ -1,4 +1,0 @@
----
-- name: Mirror yaml
-  include_tasks: mirror.yml
-  tags: mirror
