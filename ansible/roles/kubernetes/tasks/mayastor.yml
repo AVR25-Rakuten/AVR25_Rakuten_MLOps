@@ -5,8 +5,89 @@
     mayastor_chart_version: "4.3.3"
     data_node_group: "datas"                 # groupe Ansible de tes nœuds storage
     mayastor_disk_device_default: "/dev/nvme0n2"
+    # Variables pour Kyverno
+    kyverno_namespace: "kyverno"
+    kyverno_extra_args: "--webhookServerHost=0.0.0.0"
   block:
-    # --- Nettoyage des ressources existantes ---
+    # --- Correction de Kyverno pour le webhook ---
+    - name: Mettre à jour Kyverno pour écouter sur 0.0.0.0:9443
+      block:
+        - name: Récupérer les valeurs actuelles de Kyverno
+          command: helm get values kyverno -n {{ kyverno_namespace }}
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+          register: kyverno_current_values
+          ignore_errors: yes
+          tags: [kyverno, webhook]
+
+        - name: Définir les nouvelles valeurs pour Kyverno
+          set_fact:
+            kyverno_values: |
+              admissionController:
+                hostNetwork: true
+                dnsPolicy: ClusterFirstWithHostNet
+                webhookServer:
+                  port: 9443
+                extraArgs:
+                  - {{ kyverno_extra_args }}
+          tags: [kyverno, webhook]
+
+        - name: Créer un fichier temporaire pour les valeurs Kyverno
+          copy:
+            dest: "/tmp/kyverno-values.yaml"
+            content: "{{ kyverno_values }}"
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          tags: [kyverno, webhook]
+
+        - name: Mettre à jour Kyverno avec Helm
+          kubernetes.core.helm:
+            name: kyverno
+            namespace: "{{ kyverno_namespace }}"
+            chart_ref: kyverno/kyverno
+            values_files: "/tmp/kyverno-values.yaml"
+            state: present
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+          tags: [kyverno, webhook]
+
+        - name: Vérifier que Kyverno écoute sur 0.0.0.0:9443
+          shell: ss -tulnp | grep 9443 || true
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          register: kyverno_listen_check
+          tags: [kyverno, webhook]
+
+        - name: Afficher le statut de l'écoute de Kyverno
+          debug:
+            var: kyverno_listen_check.stdout_lines
+          tags: [kyverno, webhook]
+
+        - name: Tester la connectivité au webhook Kyverno
+          uri:
+            url: "https://192.168.200.11:9443/readyz"
+            validate_certs: no
+            method: GET
+          run_once: true
+          delegate_to: "{{ groups['masters'][0] }}"
+          become: yes
+          register: kyverno_health_check
+          ignore_errors: yes
+          tags: [kyverno, webhook]
+
+        - name: Afficher le résultat du test de connectivité
+          debug:
+            var: kyverno_health_check.status
+          tags: [kyverno, webhook]
+      tags: [kyverno, webhook]
+
+    # --- Nettoyage des ressources existantes Mayastor ---
     - name: Nettoyer les ressources Mayastor existantes
       block:
         - name: Supprimer la release Helm Mayastor
@@ -83,7 +164,7 @@
       when: inventory_hostname in groups[data_node_group]
       tags: [mayastor]
 
-    # --- Labels OpenEBS sur les nœuds data (en plus de tes labels/taints existants) ---
+    # --- Labels OpenEBS sur les nœuds data ---
     - name: Labeliser les nœuds data pour OpenEBS/Mayastor
       command: kubectl label node {{ item }} openebs.io/engine=mayastor openebs.io/csi-node=mayastor openebs.io/storage=mayastor --overwrite
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
@@ -125,7 +206,7 @@
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [mayastor, helm]
 
-    - name: Désactiver temporairement Kyverno
+    - name: Désactiver temporairement Kyverno (si nécessaire)
       command: kubectl delete validatingwebhookconfigurations kyverno-policy-validating-webhook-cfg mutatingwebhookconfigurations kyverno-policy-mutating-webhook-cfg --ignore-not-found
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
@@ -136,7 +217,7 @@
     - name: Construire les valeurs OpenEBS/Mayastor (4.3.3, option A)
       set_fact:
         openebs_values:
-          # Observability off (sinon DS openebs-alloy et Loki)
+          # Observability off
           alloy:
             enabled: false
           loki:
@@ -151,7 +232,7 @@
             replicated:
               mayastor:
                 enabled: true
-          # Mayastor : topologie + tolerations pour tes nœuds data taintés
+          # Mayastor : topologie + tolerations
           mayastor:
             csi:
               node:
@@ -254,10 +335,3 @@
       register: generated_manifests
       changed_when: false
       tags: [mayastor, generate]
-
-    # - name: Afficher les fichiers générés
-    #   debug:
-    #     var: generated_manifests.stdout_lines
-    #   when: file_stat.stat.exists
-    #   tags: [mayastor, generate]
-  tags: [mayastor]

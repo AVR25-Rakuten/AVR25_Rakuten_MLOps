@@ -2,7 +2,7 @@
 - name: Configure Kyverno with proxy settings
   vars:
     kyverno_namespace: "kyverno"
-    kyverno_version: "3.5.2"  # Dernière version du chart Helm
+    kyverno_version: "3.5.2"
     nfq_gateway_ip: "192.168.200.1"
     nfq_proxy_port: "8000"
     nfq_proxy_host: "{{ nfq_gateway_ip }}:{{ nfq_proxy_port }}"
@@ -10,10 +10,10 @@
     kyverno_mutate_prepend: true
     kyverno_enforce: false
     container_name: "kyverno"
-    # Sélecteur pour cibler les nœuds masters (utilise le label master=true présent sur tous)
+
+    # Où exécuter Kyverno
     kyverno_node_selector:
       "node-role.kubernetes.io/master": "true"
-    # Tolérations pour les nœuds masters et NotReady
     kyverno_tolerations:
       - key: "node-role.kubernetes.io/control-plane"
         operator: "Exists"
@@ -24,8 +24,22 @@
       - key: "node.kubernetes.io/unreachable"
         operator: "Exists"
         effect: "NoExecute"
+
+    # Namespaces à exempter des "disallow-*" via PolicyException
+    kyverno_exception_namespaces:
+      - kube-system
+      - "{{ kyverno_namespace }}"
+
+    # Déploiements Kyverno à redémarrer après patch ConfigMap
+    kyverno_ctrl_deploys:
+      - kyverno-admission-controller
+      - kyverno-background-controller
+      - kyverno-cleanup-controller
+      - kyverno-reports-controller
+
   block:
-    # --- Namespace Kyverno ---
+
+    # Namespace
     - name: Ensure kyverno namespace
       kubernetes.core.k8s:
         state: present
@@ -37,7 +51,7 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
-    # --- Helm repo ---
+    # Repo Helm
     - name: Add Kyverno Helm repo
       kubernetes.core.helm_repository:
         name: kyverno
@@ -48,24 +62,22 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
-    # --- Installation Kyverno (sur les masters uniquement) ---
-    - name: Install/upgrade Kyverno (with proxy + hostNetwork + nodeSelector + tolerations)
+    # Install/upgrade Kyverno
+    - name: Install/upgrade Kyverno (with proxy + hostNetwork + selectors)
       kubernetes.core.helm:
         name: kyverno
         chart_ref: kyverno/kyverno
         release_namespace: "{{ kyverno_namespace }}"
-        wait: false
-        atomic: false
+        wait: true
+        atomic: true
         create_namespace: false
         chart_version: "{{ kyverno_version }}"
         values:
           installCRDs: true
           global:
             imageRegistry: "{{ nfq_proxy_host }}"
-          # Configuration commune à tous les composants
           nodeSelector: "{{ kyverno_node_selector }}"
           tolerations: "{{ kyverno_tolerations }}"
-          # Configuration spécifique par composant
           backgroundController:
             hostNetwork: true
             dnsPolicy: ClusterFirstWithHostNet
@@ -89,18 +101,18 @@
             dnsPolicy: ClusterFirstWithHostNet
             nodeSelector: "{{ kyverno_node_selector }}"
             tolerations: "{{ kyverno_tolerations }}"
-          # Configuration pour migrate-resources (daemonset)
           migrateResources:
             enabled: true
-            tolerations: "{{ kyverno_tolerations }}"
+            hostNetwork: true
             nodeSelector: "{{ kyverno_node_selector }}"
+            tolerations: "{{ kyverno_tolerations }}"
       environment:
         K8S_AUTH_KUBECONFIG: /root/.kube/config
         KUBECONFIG: /root/.kube/config
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
-    # --- Attente des CRDs ---
+    # CRD Kyverno ready
     - name: Wait for Kyverno CRD clusterpolicies.kyverno.io to exist
       kubernetes.core.k8s_info:
         api_version: apiextensions.k8s.io/v1
@@ -113,7 +125,105 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
-    # --- Kyverno Policies Bundle (sur les masters uniquement) ---
+    # Endpoints du service prêtes
+    - name: Wait for kyverno-svc endpoints to be ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Endpoints
+        name: kyverno-svc
+        namespace: "{{ kyverno_namespace }}"
+      register: kyverno_ep
+      until: >
+        kyverno_ep.resources | length > 0 and
+        (kyverno_ep.resources.0.subsets is defined) and
+        (kyverno_ep.resources.0.subsets | length) > 0 and
+        (kyverno_ep.resources.0.subsets.0.addresses | length) > 0
+      retries: 60
+      delay: 2
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    # Attendre que les webhooks "resource" existent
+    - name: Wait for kyverno resource mutating webhooks to exist
+      kubernetes.core.k8s_info:
+        api_version: admissionregistration.k8s.io/v1
+        kind: MutatingWebhookConfiguration
+        name: kyverno-resource-mutating-webhook-cfg
+      register: mwcfg_res_exist
+      until: mwcfg_res_exist.resources | length > 0
+      retries: 60
+      delay: 2
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    - name: Wait for kyverno resource validating webhooks to exist
+      kubernetes.core.k8s_info:
+        api_version: admissionregistration.k8s.io/v1
+        kind: ValidatingWebhookConfiguration
+        name: kyverno-resource-validating-webhook-cfg
+      register: vcfg_res_exist
+      until: vcfg_res_exist.resources | length > 0
+      retries: 60
+      delay: 2
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    # ConfigMap Kyverno (tous NS + vidage resourceFilters)
+    - name: Patch Kyverno ConfigMap (all namespaces + clear resourceFilters)
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        definition: "{{ lookup('template', 'templates/kyverno/configmap-kyverno.yaml.j2') | from_yaml }}"
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    # Rollout restart propre des 4 contrôleurs (JSON Patch minimal)
+    - name: Compute restart timestamp
+      set_fact:
+        kyverno_restart_now: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    # (Optionnel) vérifier que les webhooks n'excluent plus kube-system/kyverno (tolérant)
+    - name: Check resource MutatingWebhook doesn't exclude kube-system/kyverno
+      kubernetes.core.k8s_info:
+        api_version: admissionregistration.k8s.io/v1
+        kind: MutatingWebhookConfiguration
+        name: kyverno-resource-mutating-webhook-cfg
+      register: mwcfg_res
+      retries: 30
+      delay: 3
+      until: >
+        (mwcfg_res.resources | length) > 0 and
+        ((mwcfg_res.resources.0.webhooks | default([]) | to_json) is search('kube-system')) == false and
+        ((mwcfg_res.resources.0.webhooks | default([]) | to_json) is search('kyverno')) == false
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    - name: Check resource ValidatingWebhook doesn't exclude kube-system/kyverno
+      kubernetes.core.k8s_info:
+        api_version: admissionregistration.k8s.io/v1
+        kind: ValidatingWebhookConfiguration
+        name: kyverno-resource-validating-webhook-cfg
+      register: vcfg_res
+      retries: 30
+      delay: 3
+      until: >
+        (vcfg_res.resources | length) > 0 and
+        ((vcfg_res.resources.0.webhooks | default([]) | to_json) is search('kube-system')) == false and
+        ((vcfg_res.resources.0.webhooks | default([]) | to_json) is search('kyverno')) == false
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    # PolicyException globale pour "calmer" kube-system & kyverno
+    - name: Apply PolicyException allow-system-workloads (stop events flood)
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', 'templates/policies/policyexception-allow-system-workloads.yaml.j2') | from_yaml }}"
+      when: inventory_hostname == groups['masters'][0]
+      tags: kyverno
+
+    # (Optionnel) Bundle de policies
     - name: Optionally install kyverno-policies bundle
       when:
         - kyverno_install_policies | bool
@@ -133,7 +243,18 @@
         KUBECONFIG: /root/.kube/config
       tags: kyverno
 
-    # --- Policy: Restrict Image Registries ---
+    # Supprimer l’ancienne policy pour éviter les conflits
+    - name: Ensure legacy prepend-image-registry policy is absent
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kyverno.io/v1
+        kind: ClusterPolicy
+        name: prepend-image-registry
+      when: inventory_hostname == groups['masters'][0]
+      ignore_errors: true
+      tags: kyverno
+
+    # (optionnel) Restriction des registries (si tu la maintiens)
     - name: Apply ClusterPolicy restrict-image-registries
       kubernetes.core.k8s:
         state: present
@@ -143,8 +264,8 @@
         - kyverno_enforce | bool
       tags: kyverno
 
-    # --- Policy: Prepend Image Registry (safe version) ---
-    - name: Apply ClusterPolicy prepend-image-registry (safe merge)
+    # Policy de préfixe (unique)
+    - name: Apply ClusterPolicy prepend-registry-proxy
       when:
         - kyverno_mutate_prepend | bool
         - inventory_hostname == groups['masters'][0]
@@ -153,33 +274,4 @@
         definition: "{{ lookup('template', 'templates/policies/prepend-image-registry.yaml.j2') | from_yaml }}"
       tags: kyverno
 
-    # --- PolicyException: Allow Kyverno to use hostNetwork / hostPorts ---
-    - name: Apply PolicyException to allow Kyverno hostNetwork and hostPorts
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: kyverno.io/v2
-          kind: PolicyException
-          metadata:
-            name: allow-kyverno-self-hostnetwork
-            namespace: "{{ kyverno_namespace }}"
-          spec:
-            match:
-              any:
-                - resources:
-                    namespaces:
-                      - "{{ kyverno_namespace }}"
-            exceptions:
-              - policyName: disallow-host-namespaces
-                ruleNames:
-                  - "*"
-                  - autogen-host-namespaces
-                  - host-namespaces
-              - policyName: disallow-host-ports
-                ruleNames:
-                  - "*"
-                  - autogen-host-ports
-                  - host-ports-none
-      when: inventory_hostname == groups['masters'][0]
-      tags: kyverno
   tags: kyverno

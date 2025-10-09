@@ -9,19 +9,15 @@
     remove_kube_proxy: true
     enable_hubble: true
     enable_hubble_ui: true
-
     # Plage LB-IPAM (à adapter)
     lb_ipam_blocks:
       - start: "192.168.200.100"
         stop:  "192.168.200.120"
-
     # Optionnel : IP fixe pour Hubble UI
     hubble_ui_lb_ip: ""
-
     # Sélecteurs et tolérations pour les nœuds réseau
     network_node_selector:
       "node-role.kubernetes.io/network": "true"
-
     network_tolerations:
       - key: "node-role.kubernetes.io/network"
         operator: "Equal"
@@ -36,7 +32,6 @@
       - key: "node.kubernetes.io/not-ready"
         operator: "Exists"
         effect: "NoSchedule"
-
   block:
     # ===========================================================================
     # 0) PRÉPARATION — Découverte de l'API Kubernetes
@@ -53,7 +48,6 @@
       become: yes
       environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
       tags: [cilium]
-
     - name: Définir les faits pour Cilium (API host/port)
       set_fact:
         cilium_api_host: "{{ api_hostport.stdout.split(':')[0] }}"
@@ -62,7 +56,6 @@
       delegate_to: "{{ groups['masters'][0] }}"
       delegate_facts: true
       tags: [cilium]
-
     - name: Attendre que l'API Kubernetes soit accessible
       command: kubectl --request-timeout=5s get --raw='/version'
       register: api_ping
@@ -75,7 +68,6 @@
       become: yes
       environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
       tags: [cilium]
-
     # ===========================================================================
     # 0.bis) VÉRIFICATION DU FICHIER DE VALEURS HELM (optionnel)
     # ===========================================================================
@@ -88,7 +80,6 @@
       delegate_to: "{{ groups['masters'][0] }}"
       become: yes
       tags: [cilium]
-
     # ===========================================================================
     # 1) INSTALLATION DE CILIUM — Phase 1 : Réseau de base
     # ===========================================================================
@@ -102,7 +93,13 @@
       become: yes
       environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
       tags: [cilium]
-
+    - name: Déboguer les variables
+      debug:
+        msg: "use_values_file: {{ use_values_file }}, cilium_values_stat: {{ cilium_values_stat | default({}) }}"
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      tags: [cilium]
     - name: Installer Cilium (sans KPR, images gérées par Kyverno)
       kubernetes.core.helm:
         name: cilium
@@ -114,10 +111,7 @@
         atomic: true
         timeout: 10m
         values_files: >
-          {{ [cilium_values_file]
-             if (use_values_file | default(false) | bool)
-             and (cilium_values_stat.stat.exists | default(false))
-             else omit }}
+          {{ [cilium_values_file] if use_values_file | bool else [] }}
         values:
           # NOTE: Les images ne sont PAS spécifiées ici — Kyverno les préfixe automatiquement
           operator:
@@ -142,7 +136,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-
     - name: Attendre que cilium-agent soit prêt (phase 1)
       command: kubectl -n {{ kube_system_ns }} rollout status ds/cilium --timeout=600s
       changed_when: false
@@ -151,7 +144,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-
     - name: Attendre que cilium-operator soit prêt (phase 1)
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/cilium-operator --timeout=600s
       changed_when: false
@@ -160,7 +152,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-
     # ===========================================================================
     # 2) MISE À JOUR CILIUM — Phase 2 : Activation du KPR (kube-proxy replacement)
     # ===========================================================================
@@ -175,10 +166,7 @@
         atomic: true
         timeout: 10m
         values_files: >
-          {{ [cilium_values_file]
-             if (use_values_file | default(false) | bool)
-             and (cilium_values_stat.stat.exists | default(false))
-             else omit }}
+          {{ [cilium_values_file] if use_values_file | bool else [] }}
         values:
           # NOTE: Les images ne sont PAS spécifiées ici — Kyverno les préfixe automatiquement
           operator:
@@ -208,7 +196,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-
     - name: Attendre que cilium-agent soit prêt (KPR)
       when: enable_kpr | bool
       command: kubectl -n {{ kube_system_ns }} rollout status ds/cilium --timeout=600s
@@ -218,7 +205,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-
     - name: Attendre que cilium-operator soit prêt (KPR)
       when: enable_kpr | bool
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/cilium-operator --timeout=600s
@@ -228,7 +214,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
-
     - name: Supprimer kube-proxy (si activé)
       when: enable_kpr | bool and remove_kube_proxy | bool
       block:
@@ -238,14 +223,12 @@
           delegate_to: "{{ groups['masters'][0] }}"
           become: yes
           environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-
         - name: Supprimer le ConfigMap kube-proxy
           command: kubectl -n kube-system delete cm kube-proxy --ignore-not-found=true
           run_once: true
           delegate_to: "{{ groups['masters'][0] }}"
           become: yes
           environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
-
         - name: Nettoyer les règles iptables KUBE*
           ansible.builtin.shell: |
             set -euo pipefail
@@ -254,7 +237,6 @@
             executable: /bin/bash
           become: yes
       tags: [cilium]
-
     # ===========================================================================
     # 3) ACTIVATION DE HUBBLE — Phase 3 : Observabilité
     # ===========================================================================
@@ -268,10 +250,7 @@
         wait: true
         timeout: 10m
         values_files: >
-          {{ [cilium_values_file]
-             if (use_values_file | default(false) | bool)
-             and (cilium_values_stat.stat.exists | default(false))
-             else omit }}
+          {{ [cilium_values_file] if use_values_file | bool else [] }}
         values:
           # NOTE: Les images ne sont PAS spécifiées ici — Kyverno les préfixe automatiquement
           operator:
@@ -308,7 +287,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, hubble]
-
     - name: Attendre que hubble-relay soit prêt
       when: enable_hubble | bool
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/hubble-relay --timeout=600s
@@ -318,7 +296,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, hubble]
-
     - name: Attendre que Hubble UI soit prêt (si activé)
       when: enable_hubble | bool and enable_hubble_ui | bool
       command: kubectl -n {{ kube_system_ns }} rollout status deploy/hubble-ui --timeout=600s
@@ -328,7 +305,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, hubble]
-
     # ===========================================================================
     # 4) CONFIGURATION L2 ET LB-IPAM — Phase 4 : Load Balancing
     # ===========================================================================
@@ -358,7 +334,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, l2]
-
     - name: Créer la politique d'annonces L2
       kubernetes.core.k8s:
         state: present
@@ -381,7 +356,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, l2]
-
     - name: Créer le Service LoadBalancer pour Hubble UI
       block:
         - name: Vérifier que le Service hubble-ui existe
@@ -391,16 +365,13 @@
           delay: 5
           until: hubble_ui_svc_exists.rc == 0
           changed_when: false
-
         - name: Récupérer la définition du Service hubble-ui
           command: kubectl -n {{ kube_system_ns }} get svc hubble-ui -o json
           register: hubble_ui_svc_json
           changed_when: false
-
         - name: Définir le sélecteur de Hubble UI
           set_fact:
             hubble_ui_selector: "{{ (hubble_ui_svc_json.stdout | from_json).spec.selector }}"
-
         - name: Créer le Service LoadBalancer pour Hubble UI
           kubernetes.core.k8s:
             state: present
@@ -426,7 +397,6 @@
                   - name: http
                     port: 80
                     targetPort: 8081
-
         - name: Attendre l'attribution d'une IP externe
           shell: >
             kubectl -n {{ kube_system_ns }} get svc hubble-ui-lb
@@ -441,7 +411,6 @@
       become: yes
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium, l2, hubble]
-
     # ===========================================================================
     # 5) VÉRIFICATIONS FINALES
     # ===========================================================================
@@ -452,7 +421,6 @@
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       tags: [cilium, l2]
-
     - name: Échouer si L2 n'est pas activé
       fail:
         msg: "EnableL2Announcements est désactivé — L2 non activé dans l'agent."
@@ -460,14 +428,12 @@
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       tags: [cilium, l2]
-
     - name: Vérifier que Kyverno a préfixé les images Cilium
       block:
         - name: Récupérer les images des pods Cilium
           command: kubectl -n {{ kube_system_ns }} get pods -o jsonpath='{.items[*].spec.containers[*].image}'
           register: cilium_pod_images
           changed_when: false
-
         - name: Échouer si les images ne sont pas préfixées
           fail:
             msg: >
@@ -477,6 +443,5 @@
       run_once: true
       delegate_to: "{{ groups['masters'][0] }}"
       tags: [cilium, verify]
-
   tags: [cilium]
   become: yes

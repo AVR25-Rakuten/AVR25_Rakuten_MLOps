@@ -1,31 +1,49 @@
+{% set reg = nfq_proxy_host %}
+{% set reg_esc = reg | regex_escape %}
+
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: restrict-image-registries
   annotations:
-    policies.kyverno.io/title: Restrict to Internal Proxy
+    policies.kyverno.io/title: Restrict Image Registries
     policies.kyverno.io/category: Supply Chain
-    policies.kyverno.io/subject: Pod
+    pod-policies.kyverno.io/autogen-controllers: "true"
 spec:
-  # Piloté par ta variable Ansible
-  validationFailureAction: {{ 'Enforce' if kyverno_enforce|bool else 'Audit' }}
-  background: true
+  background: false
+  validationFailureAction: "{{ 'Enforce' if kyverno_enforce | default(false) else 'Audit' }}"
   rules:
-  - name: only-from-internal-proxy
-    match:
-      resources:
-        kinds: ["Pod"]
-    exclude:
-      resources:
-        namespaces: ["kube-system","kyverno"]
-    validate:
-      message: "Toutes les images doivent venir de {{ nfq_proxy_host }}."
-      # Utilise les anchors Kyverno =(field) pour gérer les champs optionnels
-      pattern:
-        spec:
-          =(containers):
-          - =(image): "{{ nfq_proxy_host }}/*"
-          =(initContainers):
-          - =(image): "{{ nfq_proxy_host }}/*"
-          =(ephemeralContainers):
-          - =(image): "{{ nfq_proxy_host }}/*"
+    - name: only-through-proxy
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kyverno"]
+      validate:
+        message: >-
+          Only images from {{ reg }}/ are allowed. Please use {{ reg }}/<upstream>/<image>:<tag>.
+        foreach:
+          - list: "request.object.spec.containers || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: "^{{ reg_esc }}/.+"
+          - list: "request.object.spec.initContainers || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: "^{{ reg_esc }}/.+"
+          - list: "request.object.spec.ephemeralContainers || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: "^{{ reg_esc }}/.+"

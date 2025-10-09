@@ -16,13 +16,11 @@
         - apt-daily.service
         - apt-daily-upgrade.service
       ignore_errors: yes
-
     - name: Kill any lingering apt/dpkg processes
       shell: |
         pgrep -f 'apt.systemd.daily|unattended-upgrade|apt-get|aptitude|dpkg' | xargs -r kill -9
       changed_when: false
       failed_when: false
-
     - name: Remove dpkg/apt lock files
       file:
         path: "{{ item }}"
@@ -33,7 +31,6 @@
         - /var/cache/apt/archives/lock
       changed_when: false
       failed_when: false
-
     - name: Quickly fix half-configured packages
       environment:
         DEBIAN_FRONTEND: noninteractive
@@ -42,8 +39,6 @@
       changed_when: false
       failed_when: false
   tags: install
-
-
 
 # Configuration initiale
 - name: Gather all facts
@@ -59,7 +54,6 @@
         src: /etc/hosts
         dest: /etc/hosts.bak
         remote_src: yes
-
     # Ajoute l'endpoint du plan de contrôle à /etc/hosts
     - name: Add control plane endpoint to /etc/hosts
       lineinfile:
@@ -67,7 +61,6 @@
         line: "{{ kubeadm_advertise_address }} {{ kubeadm_control_plane_endpoint }} {{ kubeadm_control_plane_endpoint }}.{{ dns_domain }}"
         state: present
         create: yes
-
     # Ajoute tous les maîtres à /etc/hosts
     - name: Add all masters to /etc/hosts
       lineinfile:
@@ -76,7 +69,6 @@
         state: present
       when: item in groups['masters'] | default([])
       loop: "{{ groups['masters'] | default([]) }}"
-
     # Ajoute tous les travailleurs à /etc/hosts
     - name: Add all workers to /etc/hosts
       lineinfile:
@@ -98,7 +90,6 @@
           net.ipv4.ip_forward = 1
           net.bridge.bridge-nf-call-iptables = 1
           net.bridge.bridge-nf-call-ip6tables = 1
-
     # Applique les paramètres sysctl
     - name: Apply sysctl settings
       command: sysctl --system
@@ -108,25 +99,27 @@
   stat:
     path: /var/lib/apt/lists/lock
   register: apt_lock_file
+  tags: install
 
 - name: Remove apt lock file if it exists
   file:
     path: /var/lib/apt/lists/lock
     state: absent
   when: apt_lock_file.stat.exists
+  tags: install
 
 - name: Check if dpkg lock frontend file exists
   stat:
     path: /var/lib/dpkg/lock-frontend
   register: dpkg_lock_frontend_file
+  tags: install
 
 - name: Remove dpkg lock frontend file if it exists
   file:
     path: /var/lib/dpkg/lock-frontend
     state: absent
   when: dpkg_lock_frontend_file.stat.exists
-
-
+  tags: install
 
 # Installation des prérequis système
 # Installe les paquets de base nécessaires pour Kubernetes
@@ -154,27 +147,23 @@
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
         state: present
-
     # Ajoute le dépôt Docker
     - name: Add Docker repository
       apt_repository:
         repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
         state: present
-
     # Installe containerd.io
     - name: Install containerd.io
       apt:
         name: containerd.io
         state: present
         update_cache: yes
-
     # Arrête le service containerd s'il est en cours d'exécution
     - name: Stop containerd service
       systemd:
         name: containerd
         state: stopped
       ignore_errors: yes
-
     # Crée les répertoires de configuration pour containerd
     - name: Create containerd config directories
       file:
@@ -184,42 +173,32 @@
       loop:
         - /etc/containerd
         - /etc/systemd/system/containerd.service.d
-
     # Génère la configuration par défaut de containerd
     - name: Generate default containerd config
       shell: containerd config default > /etc/containerd/config.toml
       args:
         creates: /etc/containerd/config.toml
-
-
-
     - name: Configure containerd for Kubernetes
       copy:
         dest: /etc/containerd/config.toml
         content: |
           version = 2
-
           [plugins."io.containerd.grpc.v1.cri"]
             disable = false
             sandbox_image = "{{ nfq_proxy_host }}/registry.k8s.io/pause:3.10.1"
-
             [plugins."io.containerd.grpc.v1.cri".registry]
               config_path = "/etc/containerd/certs.d"
-
             [plugins."io.containerd.grpc.v1.cri".containerd]
               [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
                 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
                   runtime_type = "io.containerd.runc.v2"
                   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
                     SystemdCgroup = true
-
     - name: Ensure certs.d dir for containerd proxy
       file:
         path: "/etc/containerd/certs.d/{{ nfq_proxy_host }}"
         state: directory
         mode: '0755'
-
-
     # - name: Fetch CA certificate from API registry
     #   get_url:
     #     url: "https://{{ nfq_proxy_host }}/ca"
@@ -230,7 +209,6 @@
     #   retries: 3
     #   delay: 3
     #   until: ca_download is succeeded
-
     # - name: Update CA certificates store
     #   command: update-ca-certificates
     #   register: ca_update
@@ -238,12 +216,9 @@
     #     ca_update.rc == 0 and
     #     (ca_update.stdout is defined and
     #     ('Adding' in ca_update.stdout or 'done' in ca_update.stdout))
-
-
     - name: Define canonical CA path for the registry (single source of truth)
       set_fact:
         nfq_registry_ca_node_path: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/ca.crt"
-
     - name: Fetch NFQ registry CA once into containerd certs.d
       get_url:
         url: "https://{{ nfq_proxy_host }}/ca"
@@ -255,7 +230,6 @@
       retries: 3
       delay: 3
       until: ca_download is succeeded
-
     - name: Verify the downloaded certificate is a real CA (BasicConstraints CA TRUE)
       shell: |
         set -e
@@ -264,21 +238,18 @@
       register: ca_check
       changed_when: false
       failed_when: ca_check.rc != 0 or ('CA:TRUE' not in ca_check.stdout)
-
     - name: Expose the same CA to the system trust via symlink (no duplication)
       file:
         src: "{{ nfq_registry_ca_node_path }}"
         dest: "/usr/local/share/ca-certificates/nfq-registry.crt"
         state: link
         force: yes
-
     - name: Update system CA certificates (idempotent changed_when)
       command: update-ca-certificates
       register: ca_update
       changed_when: >
         'Adding' in (ca_update.stdout | default('')) or
         'done'   in (ca_update.stdout | default(''))
-
     - name: Configure hosts.toml for proxy with custom CA
       copy:
         dest: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/hosts.toml"
@@ -288,16 +259,11 @@
           [host."https://{{ nfq_proxy_host }}"]
             capabilities = ["pull", "resolve"]
             ca = "{{ nfq_registry_ca_node_path }}"
-
-
     - name: Restart containerd to pick up CA changes
       systemd:
         name: containerd
         state: restarted
         daemon_reload: yes
-
-
-
     - name: Configure hosts.toml for proxy with custom CA
       copy:
         dest: "/etc/containerd/certs.d/{{ nfq_proxy_host }}/hosts.toml"
@@ -306,10 +272,6 @@
           server = "https://{{ nfq_proxy_host }}"
           [host."https://{{ nfq_proxy_host }}"]
             capabilities = ["pull", "resolve"]
-            
-
-
-
 
     # Configure le service systemd pour containerd
     - name: Configure containerd systemd service
@@ -319,39 +281,33 @@
           [Service]
           ExecStartPre=/sbin/modprobe overlay
           ExecStartPre=/sbin/modprobe br_netfilter
-
     # Recharge le démon systemd
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
-
     # Démarre et active le service containerd
     - name: Start containerd service
       systemd:
         name: containerd
         state: started
         enabled: yes
-
     # Vérifie que containerd est en cours d'exécution
     - name: Verify containerd is running
       systemd:
         name: containerd
         state: started
-
     # Télécharge le binaire crictl
     - name: Download crictl binary
       get_url:
         url: https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.0/crictl-v1.30.0-linux-amd64.tar.gz
         dest: /tmp/crictl.tar.gz
         mode: '0755'
-
     # Extrait le binaire crictl
     - name: Extract crictl binary
       unarchive:
         src: /tmp/crictl.tar.gz
         dest: /usr/local/bin/
         remote_src: yes
-
     # Définit les permissions pour crictl
     - name: Set crictl permissions
       file:
@@ -359,7 +315,6 @@
         mode: '0755'
         owner: root
         group: root
-
     # Configure crictl
     - name: Configure crictl
       copy:
@@ -407,6 +362,7 @@
     path: /var/lib/kubelet
     state: directory
     mode: '0755'
+  tags: install
 
 # Configure kubelet pour utiliser systemd comme gestionnaire de cgroups et containerd comme runtime de conteneurs
 - name: Configure kubelet
@@ -418,6 +374,7 @@
       cgroupDriver: systemd
       containerRuntimeEndpoint: "unix:///var/run/containerd/containerd.sock"
       # Ajoutez d'autres configurations nécessaires ici
+  tags: install
 
 # Configuration du système pour Kubernetes
 - name: Configure kernel modules
@@ -435,7 +392,6 @@
         - ip_vs_wrr
         - ip_vs_sh
         - nf_conntrack
-
     # Rend les modules noyau persistants
     - name: Persist kernel modules
       copy:
@@ -458,12 +414,10 @@
       register: swap_status
       changed_when: false
       ignore_errors: yes
-
     # Désactive la swap si elle est active
     - name: Disable active swap
       command: swapoff -a
       when: swap_status.rc == 0
-
     # Supprime la swap du fichier fstab
     - name: Remove swap from fstab
       replace:
@@ -482,7 +436,6 @@
         path: /etc/default
         state: directory
         mode: '0755'
-
     # Configure les arguments supplémentaires pour kubelet
     - name: Configure kubelet extra args
       copy:
@@ -500,8 +453,6 @@
     daemon_reload: yes
   tags: install
 
-
-
 # Initialisation du cluster
 - name: Initialize Kubernetes cluster
   block:
@@ -512,7 +463,6 @@
         state: directory
         mode: '0755'
       when: inventory_hostname == groups['masters'][0]
-
     # Génère la configuration pour kubeadm sur le premier maître
     - name: Generate kubeadm config
       template:
@@ -522,19 +472,16 @@
         group: root
         mode: '0644'
       when: inventory_hostname == groups['masters'][0]
-
     # Télécharge les images Kubernetes sur le premier maître
     - name: Pull Kubernetes images
       command: kubeadm config images pull --config /etc/kubernetes/kubeadm-config.yaml
       when: inventory_hostname == groups['masters'][0]
-
     # Réinitialise kubeadm
-    - name: Reset kubeadm 
+    - name: Reset kubeadm
       command: kubeadm reset -f
       register: reset_cp
       failed_when: false
       changed_when: "'[reset]' in reset_cp.stdout or reset_cp.stderr"
-      
 
     # Démarre et active kubelet sur le premier maître
     - name: Start kubelet on master1
@@ -543,13 +490,11 @@
         state: started
         enabled: yes
       when: inventory_hostname == groups['masters'][0]
-
     # Initialise le cluster sur le premier maître
     - name: Initialize cluster
       command: kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --upload-certs
       register: kubeadm_init
       when: inventory_hostname == groups['masters'][0]
-
     # Crée le répertoire .kube pour le premier maître
     - name: Create .kube directory
       file:
@@ -557,7 +502,6 @@
         state: directory
         mode: '0755'
       when: inventory_hostname == groups['masters'][0]
-
     # Copie la configuration admin pour kubectl sur le premier maître
     - name: Copy admin config
       copy:
@@ -568,62 +512,46 @@
         group: root
         mode: '0644'
       when: inventory_hostname == groups['masters'][0]
-
-
-
     # # 1) Installer Helm sur master1 (idempotent)
     # - name: Ensure Helm is installed (on first master)
     #   import_tasks: helm.yml
     #   when: inventory_hostname in groups['masters']
     #   tags: ['helm', 'kyverno']
-
     # # 2) Installer & configurer Kyverno (utilise helm)
     # - name: Install & configure Kyverno (on first master only)
     #   import_tasks: kyverno.yml
     #   when: inventory_hostname == groups['masters']
     #   tags: ['install', 'kyverno']
-
-
-
-
-
-
     # Génère la clé de certificat
     - name: Get certificate key
       command: kubeadm certs certificate-key
       register: cert_key
       when: inventory_hostname == groups['masters'][0]
-
     # Définit le fait pour la clé de certificat
     - name: Set certificate key fact
       set_fact:
         kube_cert_key: "{{ cert_key.stdout }}"
       when: inventory_hostname == groups['masters'][0]
-
     # Génère la commande de jointure pour les nœuds de contrôle
     - name: Generate join command for control plane nodes
       command: kubeadm token create --print-join-command --certificate-key {{ kube_cert_key }}
       register: control_plane_join_command
       when: inventory_hostname == groups['masters'][0]
-
     # Génère la commande de jointure pour les nœuds de travailleurs
     - name: Generate join command for worker nodes
       command: kubeadm token create --print-join-command
       register: worker_join_command
       when: inventory_hostname == groups['masters'][0]
-
     # Génère la commande de jointure pour les nœuds de données
     - name: Generate join command for data nodes
       command: kubeadm token create --print-join-command
       register: data_join_command
       when: inventory_hostname == groups['masters'][0]
-
     # Génère la commande de jointure pour les nœuds de travailleurs
     - name: Generate join command for network nodes
       command: kubeadm token create --print-join-command
       register: network_join_command
       when: inventory_hostname == groups['masters'][0]
-
     # Définit les faits pour les commandes de jointure
     - name: Set join command facts
       set_fact:
@@ -632,7 +560,6 @@
         kube_data_join_command: "{{ data_join_command.stdout }}"
         kube_network_join_command: "{{ network_join_command.stdout }}"
       when: inventory_hostname == groups['masters'][0]
-
     # Réinitialise kubeadm sur les maîtres supplémentaires si nécessaire
     - name: Reset kubeadm on additional masters if previously attempted
       command: kubeadm reset -f
@@ -640,14 +567,12 @@
       failed_when: false
       changed_when: "'[reset]' in reset_cp.stdout or reset_cp.stderr"
       when: inventory_hostname in groups['masters'][1:]
-
     # Nettoie le répertoire PKI sur les maîtres supplémentaires
     - name: Ensure PKI dir is clean on additional masters
       file:
         path: /etc/kubernetes/pki
         state: absent
       when: inventory_hostname in groups['masters'][1:]
-
     # Recrée le répertoire PKI sur les maîtres supplémentaires
     - name: Recreate PKI dir
       file:
@@ -655,7 +580,6 @@
         state: directory
         mode: '0755'
       when: inventory_hostname in groups['masters'][1:]
-
     # Télécharge les certificats du plan de contrôle avec la clé générée
     - name: Upload control-plane certs with the generated key
       command: kubeadm init phase upload-certs --upload-certs --certificate-key {{ kube_cert_key }}
@@ -683,7 +607,6 @@
         owner: 1000
         group: 1000
       when: inventory_hostname in groups['masters']
-
     - name: Copy admin.conf to user 1000's .kube directory
       copy:
         src: /etc/kubernetes/admin.conf
@@ -693,7 +616,6 @@
         group: 1000
         mode: '0644'
       when: inventory_hostname in groups['masters']
-
     - name: Set correct ownership for .kube/config
       file:
         path: "/home/{{ ansible_user }}/.kube/config"
@@ -721,7 +643,6 @@
     - hostvars[groups['masters'][0]]['kube_data_join_command'] is defined
   tags: install
 
-
 # Joint les nœuds de travailleurs au cluster
 - name: Join network nodes to cluster
   command: "{{ hostvars[groups['masters'][0]]['kube_network_join_command'] }}"
@@ -730,7 +651,6 @@
     - inventory_hostname in groups['networks']
     - hostvars[groups['masters'][0]]['kube_network_join_command'] is defined
   tags: install
-
 
 # --- Python deps pour modules kubernetes.core (sur master1) ---
 - name: Ensure Python deps for kubernetes.core on master1 (system site-packages)
@@ -742,7 +662,6 @@
         name: python3-pip
         state: present
         update_cache: yes
-
     # PEP 668: on force l’install dans l’environnement système (OK sur tes VMs dédiées)
     - name: Install Python libs needed by kubernetes.core
       pip:
@@ -754,10 +673,9 @@
           - jsonpatch
         executable: pip3
         extra_args: "--break-system-packages"
-
     - name: Verify Python kubernetes import
       command: python3 -c "import kubernetes, yaml, requests; print('k8s-py-ok')"
-
+  tags: install
 
 # --- RESTORE MODE: réactiver APT/Dpkg auto après l'install ---
 - name: Re-enable APT services/timers (restore mode)
@@ -773,11 +691,9 @@
         - apt-daily.service
         - apt-daily-upgrade.service
       ignore_errors: yes
-
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
-
     - name: Enable & start apt timers
       systemd:
         name: "{{ item }}"
@@ -787,7 +703,6 @@
         - apt-daily.timer
         - apt-daily-upgrade.timer
       ignore_errors: yes
-
     - name: Enable & start unattended-upgrades
       systemd:
         name: unattended-upgrades

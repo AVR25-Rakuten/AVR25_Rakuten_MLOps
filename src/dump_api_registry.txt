@@ -1,0 +1,1361 @@
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./Dockerfile ===
+FROM ubuntu:noble-20250127
+
+ARG DEBIAN_FRONTEND=noninteractive
+# Optionnel : changer de miroir APT à la build
+#   docker build --build-arg APT_MIRROR=https://azure.archive.ubuntu.com/ubuntu ...
+ARG APT_MIRROR=
+
+WORKDIR /app
+
+# ---- Variables d'env (proxy + health) ----
+ENV SERVICE_NAME="api-registry" \
+    APP_TLS="true" \
+    LISTEN_HOST="0.0.0.0" \
+    LISTEN_PORT="8000" \
+    \
+    REG_LOCAL_BASE_URL="http://internal-registry:5000" \
+    TAMPON_REGISTRY="internal-registry:5000" \
+    INSECURE_SRC="false" \
+    INSECURE_DEST="true" \
+    MAX_CONCURRENT_COPIES="4" \
+    \
+    # Mode mirroring (rapide par défaut: 1 arch)
+    MIRROR_ALL_ARCHS="false" \
+    PLATFORM_OS="linux" \
+    PLATFORM_ARCH="" \
+    PLATFORM_VARIANT="" \
+    \
+    # Nginx / fcgiwrap (health)
+    NGINX_CONFIG_FILE="/etc/nginx/nginx.conf" \
+    HEALTH_CHECK_FILE="/usr/local/bin/health-check.sh" \
+    \
+    # Certificats (partagés uvicorn/nginx)
+    REGISTRY_NFQ_KEY_PATH="/etc/ssl/registry-nfq/registry-nfq.key" \
+    REGISTRY_NFQ_CERT_PATH="/etc/ssl/registry-nfq/registry-nfq.crt" \
+    REGISTRY_NFQ_CA_PATH="/etc/ssl/registry-nfq/registry-nfq.ca" \
+    REGISTRY_NFQ_PEM_PATH="/etc/ssl/registry-nfq/registry-nfq.pem"
+
+# ---- Dépendances système (HTTPS + retries + IPv4 + miroir optionnel) ----
+RUN set -eux; \
+    sed -ri 's#http://(archive|security)\.ubuntu\.com/ubuntu#https://\1.ubuntu.com/ubuntu#g' /etc/apt/sources.list || true; \
+    if [ -n "$APT_MIRROR" ]; then \
+      sed -ri "s#https://archive\.ubuntu\.com/ubuntu#${APT_MIRROR}#g" /etc/apt/sources.list; \
+    fi; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ForceIPv4=true update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl jq openssl \
+        python3 python3-pip \
+        nginx fcgiwrap spawn-fcgi \
+        skopeo \
+    ; rm -rf /var/lib/apt/lists/*
+
+# ---- Python deps ----
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
+
+# ---- Scripts (entrypoint + nginx/fcgi/health) ----
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY nginx/nginx-fcgiwrap.sh /usr/local/bin/nginx-fcgiwrap.sh
+COPY nginx/nginx-conf.sh /usr/local/bin/nginx-conf.sh
+COPY nginx/health-check.sh /usr/local/bin/health-check.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/nginx-fcgiwrap.sh /usr/local/bin/nginx-conf.sh /usr/local/bin/health-check.sh
+
+# ---- Application ----
+COPY api /app/api
+
+# ---- Tests intégrés ----
+COPY tests /opt/tests
+RUN chmod +x /opt/tests/run-tests.sh && ln -sf /opt/tests/run-tests.sh /usr/local/bin/run-tests
+
+EXPOSE 443 8000
+ENTRYPOINT ["entrypoint.sh"]
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./README.md ===
+# registry-nfq-proxy (FastAPI) — Nginx health only
+
+- **FastAPI** joue le rôle de **proxy de registry** (port 8000, TLS self-signed par défaut).
+- **Nginx+fcgiwrap** ne sert qu'un **/health** sur 443.
+- **Sans NFQUEUE**. Préchargement déclenché par GET/HEAD des manifests.
+- États transitoires via `202 Accepted` et endpoint `GET /ensure-status/{reg}/{name}/{ref}`.
+
+## Démarrer
+```bash
+docker compose up -d --build
+curl -k https://localhost/health
+curl -kI https://localhost:8000/v2/
+```
+
+## Copier avec skopeo
+```bash
+# push vers tampon via proxy
+skopeo copy --retry-times 3 docker://docker.io/library/busybox:latest \      docker://localhost:8000/library/busybox:itestpush --dest-tls-verify=false
+
+# pull depuis le proxy
+skopeo copy --retry-times 3 --src-tls-verify=false \      docker://localhost:8000/library/busybox:itestpush dir:/tmp/out
+```
+
+## Tests
+```bash
+docker exec -it registry-nfq run-tests
+```
+
+## Variables utiles
+- `REG_LOCAL_BASE_URL` (default: `http://internal-registry:5000`)
+- `TAMPON_REGISTRY` (default: `internal-registry:5000`)
+- `INSECURE_SRC`, `INSECURE_DEST`
+- `APP_TLS` (true/false), `LISTEN_HOST`, `LISTEN_PORT`
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./tests/pytest.ini ===
+[pytest]
+markers =
+    integration: end-to-end tests for registry-nfq
+filterwarnings =
+    ignore::urllib3.exceptions.InsecureRequestWarning
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./tests/run-tests.sh ===
+#!/usr/bin/env bash
+set -euo pipefail
+cd /opt/tests
+echo "[tests] Running pytest in $(pwd)..."
+pytest -q -m "integration" -s
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./tests/test_integration.py ===
+import os, time, subprocess, shutil
+import requests
+import pytest
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+
+PROXY_BASE = os.getenv("PROXY_BASE", "https://localhost:8000")
+VERIFY = os.getenv("TLS_VERIFY", "false").lower() in ("1","true","yes")
+
+def run(cmd):
+    print("[cmd]", " ".join(cmd))
+    subprocess.check_call(cmd)
+
+@pytest.mark.integration
+def test_proxy_is_up():
+    r = requests.get(f"{PROXY_BASE}/healthz", verify=VERIFY)
+    assert r.status_code == 200
+    r = requests.get(f"{PROXY_BASE}/v2/", verify=VERIFY)
+    assert r.status_code == 200
+
+@pytest.mark.integration
+def test_ca_endpoint_available_and_valid():
+    """Teste que le /ca retourne un certificat PEM valide"""
+    r = requests.get(f"{PROXY_BASE}/ca", verify=False, timeout=5)
+    assert r.status_code == 200, f"/ca returned {r.status_code}"
+    assert b"-----BEGIN CERTIFICATE-----" in r.content, "Not a PEM format CA"
+    # Vérifie qu'on peut parser le certificat
+    try:
+        cert = x509.load_pem_x509_certificate(r.content, default_backend())
+        assert cert.subject is not None
+        print("CA Subject:", cert.subject)
+    except Exception as e:
+        pytest.fail(f"Invalid PEM certificate: {e}")
+
+@pytest.mark.integration
+def test_push_then_pull_busybox():
+    repo = "library/busybox"
+    tag = "itestpush"
+
+    # push via proxy -> tampon
+    run([
+        "skopeo","copy","--retry-times","3",
+        "docker://docker.io/library/busybox:latest",
+        f"docker://localhost:8000/{repo}:{tag}",
+        "--dest-tls-verify=false"
+    ])
+
+    # wait ready using ensure-status (poll 45s max)
+    status_url = f"{PROXY_BASE}/ensure-status/{repo.split('/')[0]}/{repo.split('/')[1]}/{tag}"
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        r = requests.get(status_url, verify=VERIFY, timeout=5)
+        if r.status_code == 200:
+            break
+        elif r.status_code == 202:
+            time.sleep(int(r.headers.get("Retry-After","1")))
+        else:
+            time.sleep(1)
+    else:
+        raise AssertionError("Prefetch (push) not ready in time")
+
+    # pull via proxy (should hit cache)
+    outdir = "/tmp/proxy-pull-itestpush"
+    shutil.rmtree(outdir, ignore_errors=True)
+    run([
+        "skopeo","copy","--retry-times","3","--src-tls-verify=false",
+        f"docker://localhost:8000/{repo}:{tag}",
+        f"dir:{outdir}"
+    ])
+
+@pytest.mark.integration
+def test_prefetch_status_async():
+    repo = "library/busybox"
+    tag = "latest"
+
+    r = requests.get(f"{PROXY_BASE}/v2/{repo}/manifests/{tag}?async=1", verify=False, headers={"Prefer":"respond-async"})
+    assert r.status_code == 202
+
+    status_url = f"{PROXY_BASE}/ensure-status/{repo.split('/')[0]}/{repo.split('/')[1]}/{tag}"
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        r = requests.get(status_url, verify=False, timeout=5)
+        if r.status_code == 200:
+            return
+        elif r.status_code == 202:
+            time.sleep(int(r.headers.get("Retry-After","1")))
+        else:
+            time.sleep(1)
+    raise AssertionError("Async ensure not ready in time")
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./docker-compose.yml ===
+services:
+  api-registry:
+    build:
+      context: .
+    container_name: api-registry
+    ports:
+      - "443:443"     # Nginx health
+      - "8000:8000"   # FastAPI proxy (TLS)
+    environment:
+      REG_LOCAL_BASE_URL: "http://internal-registry:5000"   # ✅ bon port conteneur
+      TAMPON_REGISTRY: "internal-registry:5000"             # ✅ bon port conteneur
+      INSECURE_DEST: "true"
+      LISTEN_HOST: "0.0.0.0"
+      LISTEN_PORT: "8000"
+      APP_TLS: "true"
+      MIRROR_ALL_ARCHS: "false"
+      PLATFORM_OS: "linux"
+      PLATFORM_ARCH: "amd64"
+    depends_on:
+      - internal-registry
+
+  internal-registry:
+    image: registry:2
+    container_name: internal-registry
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"              
+    # ports:
+    #   - "5000:5000"    
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./nginx/nginx-fcgiwrap.sh ===
+#!/bin/bash
+set -euo pipefail
+SOCK="/var/run/fcgiwrap/fcgiwrap.socket"
+USER="www-data"
+GROUP="www-data"
+
+mkdir -p "$(dirname "$SOCK")"
+chown "$USER:$GROUP" "$(dirname "$SOCK")" || true
+rm -f "$SOCK"
+
+# Start fcgiwrap via spawn-fcgi
+spawn-fcgi -s "$SOCK" -U "$USER" -G "$GROUP" -M 766 /usr/sbin/fcgiwrap
+
+# Wait socket
+for i in {1..50}; do
+  [ -S "$SOCK" ] && break
+  sleep 0.1
+done
+[ -S "$SOCK" ] || { echo "fcgiwrap socket not found: $SOCK" >&2; exit 1; }
+
+# Generate nginx conf (health only)
+/usr/local/bin/nginx-conf.sh
+
+# Test and run nginx in foreground
+nginx -t -c "$NGINX_CONFIG_FILE"
+exec nginx -g 'daemon off;' -c "$NGINX_CONFIG_FILE"
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./nginx/health-check.sh ===
+#!/bin/sh
+echo "Status: 200 OK"
+echo "Content-Type: text/plain"
+echo
+echo "Healthy"
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./nginx/nginx-conf.sh ===
+#!/bin/bash
+cat <<EOF > "$NGINX_CONFIG_FILE"
+events { worker_connections 1024; }
+http {
+  log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+  access_log /dev/stdout main;
+  error_log  /dev/stderr info;
+
+  server {
+    listen 443 ssl;
+    server_name $SERVICE_NAME;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_certificate     $REGISTRY_NFQ_CERT_PATH;
+    ssl_certificate_key $REGISTRY_NFQ_KEY_PATH;
+
+    # Health only (via fcgi)
+    location /health {
+      include fastcgi_params;
+      fastcgi_pass unix:/var/run/fcgiwrap/fcgiwrap.socket;
+      fastcgi_param SCRIPT_FILENAME $HEALTH_CHECK_FILE;
+      fastcgi_param DOCUMENT_ROOT /usr/local/bin;
+      fastcgi_param SCRIPT_NAME health-check.sh;
+      fastcgi_param QUERY_STRING "";
+    }
+  }
+}
+EOF
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./requirements.txt ===
+fastapi
+uvicorn
+httpx
+pydantic-settings
+pytest
+requests
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./entrypoint.sh ===
+#!/bin/bash
+set -euo pipefail
+
+# TODO: implémenter vaultt
+# Generate CA and certs if not present
+if [ ! -f "$REGISTRY_NFQ_CERT_PATH" ] || [ ! -f "$REGISTRY_NFQ_KEY_PATH" ]; then
+  echo "[entrypoint] Generating CA and certs for $SERVICE_NAME ..."
+
+  # Define paths for CA files
+  REGISTRY_NFQ_CA_PATH="${REGISTRY_NFQ_CA_PATH:-/certs/nfq-registry-ca.pem}"
+  REGISTRY_NFQ_CA_KEY_PATH="${REGISTRY_NFQ_CA_KEY_PATH:-/certs/nfq-registry-ca-key.pem}"
+
+  # Create a directory for the CA and certs
+  mkdir -p "/certs"
+  mkdir -p "$(dirname "$REGISTRY_NFQ_CERT_PATH")"
+
+  # Step 1: Create CA private key
+  openssl genrsa -out "$REGISTRY_NFQ_CA_KEY_PATH" 4096
+
+  # Step 2: Generate a self-signed certificate for the CA
+  openssl req -x509 -new -nodes -key "$REGISTRY_NFQ_CA_KEY_PATH" -sha256 -days 3650 -out "$REGISTRY_NFQ_CA_PATH" -subj "/CN=$SERVICE_NAME CA"
+
+  # Step 3: Create private key for the service
+  openssl genrsa -out "$REGISTRY_NFQ_KEY_PATH" 4096
+
+  # Step 4: Create a certificate signing request (CSR) for the service
+  # --- Collecte des IPs locales ---
+  ips=$(ip -o -4 addr list | awk '{print $4}' | cut -d/ -f1)
+  # Ajoute ton IP fixe manuelle si besoin
+  EXTRA_SANS_IP="192.168.200.1"
+  ips="$ips $EXTRA_SANS_IP"
+  # Génération de la chaîne SAN
+  san_list=""
+  i=1
+  for ip in $ips; do
+    san_list="${san_list}IP.$i = $ip"$'\n'
+    ((i++))
+  done
+  # On ajoute aussi les SAN DNS les plus courants (utile si ton proxy est appelé par nom)
+  san_list="${san_list}DNS.${i}=localhost"$'\n'
+  ((i++))
+  san_list="${san_list}DNS.${i}=${SERVICE_NAME}"$'\n'
+
+  # Fichier temporaire de conf OpenSSL pour le CSR
+  tmp_conf=$(mktemp)
+  cat > "$tmp_conf" <<EOF
+[req]
+default_bits       = 4096
+distinguished_name = req_distinguished_name
+req_extensions    = v3_req
+prompt             = no
+[req_distinguished_name]
+CN = ${SERVICE_NAME}
+[v3_req]
+subjectAltName = @alt_names
+[alt_names]
+${san_list}
+EOF
+
+  # Generate CSR
+  openssl req -new -key "$REGISTRY_NFQ_KEY_PATH" -out /tmp/service.csr -config "$tmp_conf"
+
+  # Step 5: Sign the certificate with the CA
+  openssl x509 -req -in /tmp/service.csr -CA "$REGISTRY_NFQ_CA_PATH" -CAkey "$REGISTRY_NFQ_CA_KEY_PATH" -CAcreateserial -out "$REGISTRY_NFQ_CERT_PATH" -days 365 -sha256 -extfile "$tmp_conf" -extensions v3_req
+
+  # Copie dans les emplacements attendus
+  cat "$REGISTRY_NFQ_CERT_PATH" > "$REGISTRY_NFQ_PEM_PATH" || true
+
+  echo "[entrypoint] Certificate generated with SANs:"
+  echo "$san_list"
+  rm -f "$tmp_conf"
+  rm -f /tmp/service.csr
+fi
+
+set -m
+# Set log level
+LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+export LOG_LEVEL
+# Start FastAPI proxy (TLS optional)
+if [ "${APP_TLS,,}" = "true" ]; then
+  echo "[entrypoint] Starting FastAPI proxy (HTTPS) on ${LISTEN_HOST}:${LISTEN_PORT}"
+  python3 -m uvicorn api.app:app --host "${LISTEN_HOST}" --port "${LISTEN_PORT}" --ssl-keyfile "$REGISTRY_NFQ_KEY_PATH" --ssl-certfile "$REGISTRY_NFQ_CERT_PATH" &
+else
+  echo "[entrypoint] Starting FastAPI proxy (HTTP) on ${LISTEN_HOST}:${LISTEN_PORT}"
+  python3 -m uvicorn api.app:app --host "${LISTEN_HOST}" --port "${LISTEN_PORT}" &
+fi
+# Launch nginx + fcgiwrap (health only) in foreground
+/usr/local/bin/nginx-fcgiwrap.sh
+fg %1
+
+
+
+
+
+
+
+
+
+
+# #!/bin/bash
+# set -euo pipefail
+
+
+
+# #TODO: implémenter vaultt
+# # Generate self-signed certs if not present
+# # if [ ! -f "$REGISTRY_NFQ_CERT_PATH" ] || [ ! -f "$REGISTRY_NFQ_KEY_PATH" ]; then
+
+
+# #   EXTRA_SANS_IP="192.168.200.1"
+
+# #   ips=$(ip -o -4 addr list | awk '{print $4}' | cut -d/ -f1)
+
+# #   # Variable pour stocker les adresses IP séparées par des virgules
+# #   ip_list=""
+
+# #   # Boucle pour traiter chaque adresse IP
+# #   for ip in $ips; do
+# #     if [ -z "$ip_list" ]; then
+# #       ip_list="$ip"
+# #     else
+# #       ip_list="$ip_list,$ip"
+# #     fi
+# #   done
+
+
+
+# #   echo "[entrypoint] Generating self-signed certs for $SERVICE_NAME ..."
+# #   mkdir -p "$(dirname "$REGISTRY_NFQ_CERT_PATH")"
+# #   openssl req -x509 -nodes -days 365 -newkey rsa:4096         -keyout "$REGISTRY_NFQ_KEY_PATH"         -out "$REGISTRY_NFQ_CERT_PATH"         -subj "/CN=$SERVICE_NAME"
+# #   cat "$REGISTRY_NFQ_CERT_PATH" > "$REGISTRY_NFQ_PEM_PATH" || true
+# #   cat "$REGISTRY_NFQ_CERT_PATH" > "$REGISTRY_NFQ_CA_PATH" || true
+# # fi
+
+
+
+# if [ ! -f "$REGISTRY_NFQ_CERT_PATH" ] || [ ! -f "$REGISTRY_NFQ_KEY_PATH" ]; then
+#   echo "[entrypoint] Generating self-signed certs for $SERVICE_NAME ..."
+
+#   mkdir -p "$(dirname "$REGISTRY_NFQ_CERT_PATH")"
+
+#   # --- Collecte des IPs locales ---
+#   ips=$(ip -o -4 addr list | awk '{print $4}' | cut -d/ -f1)
+#   # Ajoute ton IP fixe manuelle si besoin
+#   EXTRA_SANS_IP="192.168.200.1"
+#   ips="$ips $EXTRA_SANS_IP"
+
+#   # Génération de la chaîne SAN
+#   san_list=""
+#   i=1
+#   for ip in $ips; do
+#     san_list="${san_list}IP.$i = $ip"$'\n'
+#     ((i++))
+#   done
+
+#   # On ajoute aussi les SAN DNS les plus courants (utile si ton proxy est appelé par nom)
+#   san_list="${san_list}DNS.${i}=localhost"$'\n'
+#   ((i++))
+#   san_list="${san_list}DNS.${i}=${SERVICE_NAME}"$'\n'
+
+#   # Fichier temporaire de conf OpenSSL
+#   tmp_conf=$(mktemp)
+#   cat > "$tmp_conf" <<EOF
+# [req]
+# default_bits       = 4096
+# distinguished_name = req_distinguished_name
+# x509_extensions    = v3_req
+# prompt             = no
+
+# [req_distinguished_name]
+# CN = ${SERVICE_NAME}
+
+# [v3_req]
+# subjectAltName = @alt_names
+
+# [alt_names]
+# ${san_list}
+# EOF
+
+#   # Génère le certificat autosigné avec les IPs en SAN
+#   openssl req -x509 -nodes -days 365 \
+#     -newkey rsa:4096 \
+#     -keyout "$REGISTRY_NFQ_KEY_PATH" \
+#     -out "$REGISTRY_NFQ_CERT_PATH" \
+#     -config "$tmp_conf"
+
+#   # Copie dans les emplacements attendus
+#   cat "$REGISTRY_NFQ_CERT_PATH" > "$REGISTRY_NFQ_PEM_PATH" || true
+#   cat "$REGISTRY_NFQ_CERT_PATH" > "$REGISTRY_NFQ_CA_PATH" || true
+
+#   echo "[entrypoint] Certificate generated with SANs:"
+#   echo "$san_list"
+#   rm -f "$tmp_conf"
+# fi
+
+
+
+
+# set -m
+# # Set log level
+# LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+# export LOG_LEVEL
+
+# # Start FastAPI proxy (TLS optional)
+# if [ "${APP_TLS,,}" = "true" ]; then
+#   echo "[entrypoint] Starting FastAPI proxy (HTTPS) on ${LISTEN_HOST}:${LISTEN_PORT}"
+#   python3 -m uvicorn api.app:app --host "${LISTEN_HOST}" --port "${LISTEN_PORT}" --ssl-keyfile "$REGISTRY_NFQ_KEY_PATH" --ssl-certfile "$REGISTRY_NFQ_CERT_PATH" &
+# else
+#   echo "[entrypoint] Starting FastAPI proxy (HTTP) on ${LISTEN_HOST}:${LISTEN_PORT}"
+#   python3 -m uvicorn api.app:app --host "${LISTEN_HOST}" --port "${LISTEN_PORT}" &
+# fi
+# # Launch nginx + fcgiwrap (health only) in foreground
+# /usr/local/bin/nginx-fcgiwrap.sh
+
+
+# fg %1
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./api/app.py ===
+import os
+import re
+import time
+import asyncio
+import logging
+from typing import Dict, Any
+from fastapi import FastAPI, Request, Response
+import httpx
+import sys
+
+# Configuration du logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+sys.path.insert(0, os.path.dirname(__file__))
+from utils import (
+    skopeo_inspect_digest,
+    copy_to_local_digest,
+    local_has_manifest,
+    REG_LOCAL_BASE_URL,
+)
+
+LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8000"))
+LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
+MAX_CONCURRENT_COPIES = int(os.getenv("MAX_CONCURRENT_COPIES", "4"))
+REGISTRY_NFQ_CA_PATH = os.getenv("REGISTRY_NFQ_CA_PATH", "/certs/nfq-registry-ca.pem")
+
+# Concurrency + déduplication
+ensure_lock = asyncio.Lock()
+sem = asyncio.Semaphore(MAX_CONCURRENT_COPIES)
+inflight: Dict[str, Dict[str, Any]] = {}
+app = FastAPI()
+
+METRICS = {
+    "requests_total": 0,
+    "ensures": 0,
+    "ensures_hit": 0,
+    "ensures_miss": 0,
+    "errors": 0,
+}
+
+_MANIFEST_ACCEPT = ",".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/json",
+])
+
+# ------------------- Helpers -------------------
+def parse_manifest_path(path: str):
+    m = re.match(r"^/v2/([^/]+)/(.+)/manifests/([^/]+)$", path)
+    return m.groups() if m else None
+
+def parse_blob_path(path: str):
+    m = re.match(r"^/v2/([^/]+)/(.+)/blobs/(sha256:[0-9a-f]{64})$", path)
+    return m.groups() if m else None
+
+def is_digest(ref: str) -> bool:
+    return ref.startswith("sha256:") and len(ref) == len("sha256:") + 64
+
+def digest_to_tag(digest: str) -> str:
+    # "sha256:abcd..." -> "bydigest-sha256-abcd..."
+    return f"bydigest-{digest.replace(':','-')}"
+
+def _inflight_public_view(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "key": f"{entry['reg']}/{entry['name']}@{entry.get('digest') or entry.get('ref')}",
+        "reg": entry["reg"],
+        "name": entry["name"],
+        "ref": entry.get("ref"),
+        "digest": entry.get("digest"),
+        "state": entry["state"],
+        "started": entry["started"],
+        "age_sec": round(time.time() - entry["started"], 3),
+        "waiters": entry["waiters"],
+        "attempts": entry["attempts"],
+        "last_error": entry.get("last_error"),
+    }
+
+async def _head_local_manifest(reg: str, name: str, ref_like: str, accept_hdr: str) -> httpx.Response:
+    """HEAD sur le registre local pour vérifier l'existence/cohérence d'un manifest."""
+    url = f"{REG_LOCAL_BASE_URL}/v2/{reg}/{name}/manifests/{ref_like}"
+    async with httpx.AsyncClient(timeout=None, verify=False) as client:
+        r = await client.request("HEAD", url, headers={"Accept": accept_hdr})
+    return r
+
+async def _verify_local_manifest_digest(reg: str, name: str, digest: str, accept_hdr: str) -> bool:
+    """Vérifie que /manifests/<digest> existe et que Docker-Content-Digest == <digest>."""
+    try:
+        r = await _head_local_manifest(reg, name, digest, accept_hdr)
+        if r.status_code == 200:
+            dcd = r.headers.get("Docker-Content-Digest", "").lower()
+            if dcd == digest.lower():
+                return True
+            # Certains registries ne remontent pas DCD sur HEAD; on tolère si 200
+            if not dcd:
+                return True
+            logger.warning(f"DCD mismatch for {reg}/{name}@{digest}: got {dcd}")
+    except Exception as e:
+        logger.error(f"verify_local_manifest_digest error: {e}")
+    return False
+
+# ------------------- API -------------------
+@app.get("/healthz")
+async def healthz():
+    logger.debug("Health check endpoint called")
+    return {"status": "ok"}
+
+@app.get("/metrics")
+async def metrics():
+    logger.debug("Metrics endpoint called")
+    METRICS["inflight"] = len(inflight)
+    return METRICS
+
+@app.get("/inflight")
+async def list_inflight():
+    logger.debug("List inflight endpoint called")
+    now = time.time()
+    items = []
+    for entry in list(inflight.values()):
+        if entry["state"] in ("queued", "copying"):
+            view = _inflight_public_view(entry)
+            view["age_sec"] = round(now - entry["started"], 3)
+            items.append(view)
+    logger.debug(f"Inflight items: {items}")
+    return {"count": len(items), "items": items}
+
+@app.get("/ca", response_class=Response)
+async def get_ca():
+    """
+    Retourne le certificat CA autosigné utilisé par le proxy/registry.
+    Permet aux clients d'importer le CA dans leur magasin de certificats.
+    """
+    logger.debug("CA endpoint called")
+    if not os.path.exists(REGISTRY_NFQ_CA_PATH):
+        logger.debug("CA file not found")
+        return Response("CA not found", status_code=404)
+    with open(REGISTRY_NFQ_CA_PATH, "rb") as f:
+        content = f.read()
+    logger.debug("CA file served successfully")
+    return Response(content, media_type="application/x-pem-file")
+
+@app.get("/v2/")
+async def ping():
+    logger.debug("Ping endpoint called")
+    return Response(status_code=200)
+
+# ------------------- Core logic -------------------
+async def _ensure_entry(reg: str, name: str, ref: str) -> Dict[str, Any]:
+    logger.debug(f"Ensuring entry for {reg}/{name}:{ref}")
+    digest_hint = ref if is_digest(ref) else None
+    async with ensure_lock:
+        key = f"{reg}/{name}@{digest_hint or ref}"
+        entry = inflight.get(key)
+        if not entry:
+            logger.debug(f"Creating new entry for {key}")
+            entry = {
+                "lock": asyncio.Lock(),
+                "state": "queued",
+                "started": time.time(),
+                "reg": reg,
+                "name": name,
+                "ref": ref,
+                "digest": digest_hint,
+                "waiters": 0,
+                "attempts": 0,
+                "last_error": None,
+            }
+            inflight[key] = entry
+        else:
+            logger.debug(f"Using existing entry for {key}")
+        entry["waiters"] += 1
+        return entry
+
+async def _rekey_entry_if_digest_known(entry: Dict[str, Any], digest: str) -> Dict[str, Any]:
+    logger.debug(f"Rekeying entry for digest {digest}")
+    if entry.get("digest") == digest:
+        return entry
+    reg, name = entry["reg"], entry["name"]
+    old_key = f"{reg}/{name}@{entry.get('digest') or entry.get('ref')}"
+    new_key = f"{reg}/{name}@{digest}"
+    async with ensure_lock:
+        if old_key == new_key:
+            return entry
+        existing = inflight.get(new_key)
+        if existing:
+            logger.debug(f"Using existing entry for {new_key}")
+            existing["waiters"] += max(0, entry["waiters"] - 1)
+            inflight.pop(old_key, None)
+            return existing
+        else:
+            logger.debug(f"Updating entry key from {old_key} to {new_key}")
+            entry["digest"] = digest
+            inflight[new_key] = entry
+            inflight.pop(old_key, None)
+            return entry
+
+async def _release_entry(entry: Dict[str, Any]):
+    logger.debug(f"Releasing entry for {entry['reg']}/{entry['name']}@{entry.get('digest') or entry.get('ref')}")
+    reg, name = entry["reg"], entry["name"]
+    key = f"{reg}/{name}@{entry.get('digest') or entry.get('ref')}"
+    async with ensure_lock:
+        entry["waiters"] = max(0, entry["waiters"] - 1)
+        if entry["state"] not in ("queued", "copying"):
+            if entry["waiters"] == 0:
+                logger.debug(f"Removing entry for {key}")
+                inflight.pop(key, None)
+
+async def ensure_local(reg: str, name: str, ref: str) -> str:
+    logger.debug(f"Ensuring local for {reg}/{name}:{ref}")
+    entry = await _ensure_entry(reg, name, ref)
+    lock: asyncio.Lock = entry["lock"]
+    async with lock:
+        try:
+            if entry.get("digest") and is_digest(entry["digest"]):
+                digest = entry["digest"]
+            else:
+                logger.debug(f"Resolving digest for {reg}/{name}:{ref}")
+                digest = await asyncio.get_event_loop().run_in_executor(
+                    None, skopeo_inspect_digest, f"{reg}/{name}:{ref}"
+                )
+                logger.debug(f"Resolved digest: {digest}")
+            entry = await _rekey_entry_if_digest_known(entry, digest)
+        except Exception as e:
+            logger.error(f"Error resolving digest: {e}")
+            entry["state"] = "error"
+            entry["last_error"] = str(e)
+            METRICS["errors"] += 1
+            await _release_entry(entry)
+            raise
+
+        accept_hdr = _MANIFEST_ACCEPT
+
+        try:
+            logger.debug(f"Checking if manifest exists locally: {reg}/{name}@{digest}")
+            if await local_has_manifest(reg, name, digest):
+                # double check par HEAD pour s'assurer du bon DCD
+                if await _verify_local_manifest_digest(reg, name, digest, accept_hdr):
+                    logger.debug(f"Manifest already exists locally and verified: {digest}")
+                    METRICS["ensures_hit"] += 1
+                    entry["state"] = "done"
+                    await _release_entry(entry)
+                    return digest
+        except Exception as e:
+            logger.error(f"Error checking local manifest: {e}")
+            entry["last_error"] = f"local_has_manifest failed: {e}"
+
+        logger.debug(f"Manifest not found locally or not verified, copying: {reg}/{name}@{digest}")
+        METRICS["ensures_miss"] += 1
+        entry["state"] = "queued"
+
+        async with sem:
+            logger.debug(f"Copying manifest: {reg}/{name}@{digest}")
+            entry["state"] = "copying"
+            entry["attempts"] += 1
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, copy_to_local_digest, reg, name, digest
+                )
+                # Vérifie que le manifeste par digest est bien présent (et correct)
+                if not await _verify_local_manifest_digest(reg, name, digest, accept_hdr):
+                    raise RuntimeError(f"Local registry did not store manifest by digest {digest} as-is")
+                logger.debug(f"Manifest copied successfully and verified: {digest}")
+                entry["state"] = "done"
+                await _release_entry(entry)
+                return digest
+            except Exception as e:
+                logger.error(f"Error copying manifest: {e}")
+                entry["state"] = "error"
+                entry["last_error"] = str(e)
+                METRICS["errors"] += 1
+                await _release_entry(entry)
+                raise
+
+# ------------------- Ensure status -------------------
+@app.get("/ensure-status/{reg}/{name}/{ref}")
+async def ensure_status(reg: str, name: str, ref: str, request: Request):
+    """
+    200 si présent localement **par digest** (ou par tag -> résolu puis vérifié par digest).
+    202 si en cours (avec Retry-After).
+    404 sinon.
+    """
+    logger.debug(f"Checking ensure status for {reg}/{name}:{ref}")
+    accept_hdr = request.headers.get("accept") or _MANIFEST_ACCEPT
+
+    # Si ref est un digest : on NE fait PAS de fallback vers le tag synthétique.
+    if is_digest(ref):
+        try:
+            if await local_has_manifest(reg, name, ref):
+                if await _verify_local_manifest_digest(reg, name, ref, accept_hdr):
+                    return Response(status_code=200)
+        except Exception as e:
+            logger.debug(f"Error checking local manifest by digest: {e}")
+        # si HEAD par digest ne passe pas, c'est 404 (pas de faux positif)
+        head = await _head_local_manifest(reg, name, ref, accept_hdr)
+        if head.status_code == 200:
+            return Response(status_code=200)
+        # sinon on continue sur l'état inflight
+    else:
+        # ref = tag : on résout le digest puis on vérifie par digest
+        try:
+            digest = await asyncio.get_event_loop().run_in_executor(
+                None, skopeo_inspect_digest, f"{reg}/{name}:{ref}"
+            )
+            if await local_has_manifest(reg, name, digest):
+                if await _verify_local_manifest_digest(reg, name, digest, accept_hdr):
+                    return Response(status_code=200)
+        except Exception as e:
+            logger.debug(f"Error resolving/checking tag: {e}")
+            # on continue
+
+    # Vérifie les ensures en cours
+    logger.debug("Checking inflight entries for matching ref or digest")
+    for e in inflight.values():
+        if e["reg"] == reg and e["name"] == name:
+            if e.get("digest") == ref or e.get("ref") == ref:
+                if e["state"] in ("queued", "copying"):
+                    logger.debug(f"Manifest is in progress: {e}")
+                    return Response(status_code=202, headers={"Retry-After": "2"})
+
+    logger.debug("Manifest not found locally or in progress")
+    return Response(status_code=404)
+
+# ------------------- Routes -------------------
+@app.api_route("/v2/{reg}/{path:path}", methods=["GET", "HEAD"])
+async def v2_router(request: Request, reg: str, path: str):
+    logger.debug(f"Incoming request: {request.method} /v2/{reg}/{path}")
+    METRICS["requests_total"] += 1
+
+    q = dict(request.query_params)
+    is_async = q.get("async") in ("1", "true", "yes")
+    prefer = request.headers.get("Prefer", "")
+    full_path = f"/v2/{reg}/{path}"
+
+    m = parse_manifest_path(full_path)
+    if m:
+        logger.debug(f"Manifest path matched: {m}")
+        METRICS["ensures"] += 1
+        reg_m, name, ref = m
+
+        # Mode async: déclenche en arrière-plan et 202 de suite
+        if is_async or "respond-async" in prefer.lower():
+            logger.debug(f"Async mode for {reg_m}/{name}:{ref}")
+            async def _bg():
+                try:
+                    await ensure_local(reg_m, name, ref)
+                except Exception as e:
+                    logger.error(f"Error in background task: {e}")
+            asyncio.create_task(_bg())
+            logger.debug(f"Background task created for {reg_m}/{name}:{ref}")
+            return Response(
+                status_code=202,
+                headers={"Location": f"/ensure-status/{reg_m}/{name}/{ref}", "Retry-After": "2"},
+            )
+
+        # Mode sync
+        logger.debug(f"Sync mode for {reg_m}/{name}:{ref}")
+        try:
+            digest = await ensure_local(reg_m, name, ref)
+            logger.debug(f"Ensured local for {reg_m}/{name}:{ref} -> {digest}")
+        except Exception as e:
+            logger.error(f"Error ensuring local: {e}")
+            return Response(str(e), status_code=502)
+
+        accept_hdr = request.headers.get("accept") or _MANIFEST_ACCEPT
+
+        async with httpx.AsyncClient(timeout=None, verify=False) as client:
+            # IMPORTANT :
+            # - si le client a demandé par digest, on NE fait PAS de fallback vers un tag synthétique.
+            # - si le client a demandé par tag, on sert directement par digest.
+            if is_digest(ref):
+                url = f"{REG_LOCAL_BASE_URL}/v2/{reg_m}/{name}/manifests/{digest}"
+                logger.debug(f"Fetching digest directly (no fallback): {url}")
+                upstream = await client.request(request.method, url, headers={"Accept": accept_hdr})
+                return Response(
+                    content=upstream.content,
+                    status_code=upstream.status_code,
+                    headers=dict(upstream.headers),
+                )
+            else:
+                # ref = tag : sert le manifeste canonique par digest (fallback tag synthétique en dernier recours)
+                candidate_refs = [digest, digest_to_tag(digest)]
+                last = None
+                for target_ref in candidate_refs:
+                    url = f"{REG_LOCAL_BASE_URL}/v2/{reg_m}/{name}/manifests/{target_ref}"
+                    logger.debug(f"Trying URL: {url}")
+                    upstream = await client.request(request.method, url, headers={"Accept": accept_hdr})
+                    if upstream.status_code != 404:
+                        logger.debug(f"Found manifest at {url}")
+                        return Response(
+                            content=upstream.content,
+                            status_code=upstream.status_code,
+                            headers=dict(upstream.headers),
+                        )
+                    last = upstream
+                logger.debug("No manifest found for tag path, returning last response")
+                return Response(
+                    content=last.content if last else b"",
+                    status_code=last.status_code if last else 404,
+                    headers=dict(last.headers) if last else {},
+                )
+
+    b = parse_blob_path(full_path)
+    if b:
+        logger.debug(f"Blob path matched: {b}")
+        reg_b, name, dg = b
+        url = f"{REG_LOCAL_BASE_URL}/v2/{reg_b}/{name}/blobs/{dg}"
+        logger.debug(f"Fetching blob from {url}")
+        async with httpx.AsyncClient(timeout=None, verify=False) as client:
+            upstream = await client.request(request.method, url)
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=dict(upstream.headers),
+        )
+
+    logger.debug("Path not matched, returning 404")
+    return Response(status_code=404)
+
+if __name__ == "__main__":
+    logger.debug("Starting server")
+    import uvicorn
+    uvicorn.run("app:app", host=LISTEN_HOST, port=LISTEN_PORT, reload=False)
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./api/__init__.py ===
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./api/utils.py ===
+import os
+import json
+import subprocess
+import platform
+import time
+import httpx
+import re
+
+# Base URL du registry tampon (interne)
+REG_LOCAL_BASE_URL = os.getenv("REG_LOCAL_BASE_URL", "http://internal-registry:5000")
+# Hôte/port du registry tampon pour skopeo
+TAMPON_REGISTRY = os.getenv("TAMPON_REGISTRY", "internal-registry:5000")
+
+# Registry amont par défaut (si le chemin demandé ne contient pas de domaine)
+UPSTREAM_REGISTRY = os.getenv("UPSTREAM_REGISTRY", "docker.io")
+
+# TLS / proxies
+INSECURE_SRC = os.getenv("INSECURE_SRC", "false").lower() in ("1", "true", "yes")
+INSECURE_DEST = os.getenv("INSECURE_DEST", "true").lower() in ("1", "true", "yes")
+
+# Mirroring: single-arch rapide par défaut, all-arch optionnel (utilisé pour les copies par TAG)
+MIRROR_ALL_ARCHS = os.getenv("MIRROR_ALL_ARCHS", "false").lower() in ("1", "true", "yes")
+PLATFORM_OS = os.getenv("PLATFORM_OS", "linux")
+PLATFORM_ARCH = os.getenv("PLATFORM_ARCH", "").lower()   # "amd64", "arm64", ...
+PLATFORM_VARIANT = os.getenv("PLATFORM_VARIANT", "")     # ex "v7" pour arm 32 bits
+
+# Retries réseau (timeouts, EOF, i/o timeout, handshake timeout…)
+SKOPEO_RETRIES = int(os.getenv("SKOPEO_RETRIES", "6"))
+SKOPEO_BACKOFF_BASE = float(os.getenv("SKOPEO_BACKOFF_BASE", "0.8"))  # secondes
+
+_MANIFEST_ACCEPT = (
+    "application/vnd.docker.distribution.manifest.v2+json,"
+    "application/vnd.docker.distribution.manifest.list.v2+json,"
+    "application/vnd.oci.image.index.v1+json,"
+    "application/vnd.oci.image.manifest.v1+json,"
+    "application/json"
+)
+
+_TRANSIENT_ERR_SNIPPETS = (
+    "tls handshake timeout",
+    "handshake timeout",
+    "i/o timeout",
+    "client.timeout exceeded",
+    "connection timed out",
+    "temporary failure",
+    "connection reset",
+    "unexpected eof",
+    "eof",
+    "proxy",
+)
+
+def _norm_arch(x: str) -> str:
+    x = x.lower()
+    return {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm", "armv6l": "arm"}.get(x, x)
+
+def _has_domain(ns: str) -> bool:
+    """Détecte si 'ns' ressemble à un host (docker.io, ghcr.io, quay.io, localhost:5000, ...)."""
+    return "." in ns or ":" in ns or ns == "localhost"
+
+def _compose_upstream_tag(reg: str, name: str, ref: str) -> str:
+    """
+    Construit 'host/namespace/name:tag' pour l’amont.
+    Si 'reg' ne contient pas de domaine, on préfixe UPSTREAM_REGISTRY (docker.io par défaut).
+    """
+    host_ns = f"{reg}/{name}" if _has_domain(reg) else f"{UPSTREAM_REGISTRY}/{reg}/{name}"
+    return f"{host_ns}:{ref}"
+
+def _compose_upstream_digest(reg: str, name: str, digest: str) -> str:
+    """
+    Construit 'host/namespace/name@sha256:...' pour l’amont.
+    """
+    host_ns = f"{reg}/{name}" if _has_domain(reg) else f"{UPSTREAM_REGISTRY}/{reg}/{name}"
+    return f"{host_ns}@{digest}"
+
+def _tls_flags(src: bool = False, dest: bool = False) -> list[str]:
+    flags: list[str] = []
+    if src and INSECURE_SRC:
+        flags += ["--src-tls-verify=false"]
+    if dest and INSECURE_DEST:
+        flags += ["--dest-tls-verify=false"]
+    return flags
+
+def _run_skopeo(args: list[str]) -> str:
+    """
+    Lance skopeo avec retries exponentiels sur erreurs transitoires réseau.
+    Retourne stdout (str) si OK, sinon relance puis finit par propager l’exception.
+    """
+    attempt = 0
+    last_err = None
+    while attempt < SKOPEO_RETRIES:
+        try:
+            return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            out = e.output or str(e)
+            if any(snip in out.lower() for snip in _TRANSIENT_ERR_SNIPPETS):
+                last_err = out
+                delay = SKOPEO_BACKOFF_BASE * (2 ** attempt)
+                time.sleep(delay)
+                attempt += 1
+                continue
+            raise
+        except Exception as e:
+            last_err = str(e)
+            delay = SKOPEO_BACKOFF_BASE * (2 ** attempt)
+            time.sleep(delay)
+            attempt += 1
+            continue
+    if last_err:
+        raise RuntimeError(f"skopeo retried {SKOPEO_RETRIES} times and still failed: {last_err}")
+    raise RuntimeError(f"skopeo failed after {SKOPEO_RETRIES} attempts")
+
+def _is_manifest_list_src(src_ref: str) -> bool:
+    """
+    Détermine si la source (docker://…) est un manifest list / OCI index.
+    Utilise `skopeo inspect --raw` et détecte la présence de 'manifests' dans le JSON.
+    """
+    cmd = ["skopeo", "inspect", "--raw"]
+    if INSECURE_SRC:
+        cmd += ["--tls-verify=false"]
+    cmd += [f"docker://{src_ref}"]
+    raw = _run_skopeo(cmd)
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "manifests" in data:
+            return True
+        mt = (data.get("mediaType") or "") if isinstance(data, dict) else ""
+        return ("manifest.list" in mt) or ("image.index" in mt)
+    except Exception:
+        # fallback simple si pas JSON "propre"
+        return "manifests" in raw
+
+def _platform_overrides() -> list[str]:
+    if MIRROR_ALL_ARCHS:
+        return ["--all"]
+    arch = PLATFORM_ARCH or _norm_arch(platform.machine())
+    flags = [f"--override-os={PLATFORM_OS}", f"--override-arch={arch}"]
+    if PLATFORM_VARIANT:
+        flags.append(f"--override-variant={PLATFORM_VARIANT}")
+    return flags
+
+def _synth_tag_from_digest(digest: str) -> str:
+    """
+    Génère un tag sûr à partir d’un digest. Ex: sha256:abc… -> bydigest-sha256-abc…
+    (max ~120 char pour rester confortable côté registry)
+    """
+    t = digest.replace(":", "-")
+    if len(t) > 120:
+        t = t[:120]
+    return f"bydigest-{t}"
+
+def skopeo_inspect_digest(ref: str) -> str:
+    """
+    Retourne le digest du manifest (tag ou digest) depuis la source publique.
+    ref: 'host/ns/name:tag' (sans docker://)
+    """
+    cmd = ["skopeo", "inspect", "--retry-times", "3"]
+    if INSECURE_SRC:
+        cmd += ["--tls-verify=false"]
+    cmd += [f"docker://{ref}"]
+    out = _run_skopeo(cmd)
+    data = json.loads(out)
+    digest = data.get("Digest")
+    if not digest:
+        raise RuntimeError(f"Digest not found for {ref}")
+    return digest
+
+async def local_has_manifest(reg: str, name: str, digest: str) -> bool:
+    """
+    Vérifie la présence locale (tampon) d’un manifest par digest.
+    On considère qu'un 200 suffit (certains registries ne renvoient pas toujours Docker-Content-Digest sur HEAD).
+    """
+    url = f"{REG_LOCAL_BASE_URL}/v2/{reg}/{name}/manifests/{digest}"
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.head(url, headers={"Accept": _MANIFEST_ACCEPT})
+    return r.status_code == 200
+
+def copy_to_local_digest(reg: str, name: str, digest: str) -> None:
+    """
+    Copie une référence source par DIGEST vers le registry tampon **en TAG synthétique**,
+    en CONSERVANT EXACTEMENT les octets (=> même digest).
+    - Toujours `--preserve-digests` pour éviter toute conversion/réécriture.
+    - Toujours `--all` pour un index multi-arch (références enfants + blobs), afin d’éviter
+      les 404 ultérieurs lors de la sélection de plate-forme côté kubelet/containerd.
+    """
+    src_ref = _compose_upstream_digest(reg, name, digest)  # host/ns/name@sha256:...
+    dest_tag = _synth_tag_from_digest(digest)
+    src = f"docker://{src_ref}"
+    dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}:{dest_tag}"
+
+    cmd = [
+        "skopeo", "copy",
+        "--retry-times", "3",
+        "--preserve-digests",
+        "--all",
+        *_tls_flags(src=True, dest=True),
+        src, dest,
+    ]
+    _run_skopeo(cmd)
+
+def copy_to_local_tag(reg: str, name: str, ref: str) -> None:
+    """
+    Copie par TAG.
+      - MIRROR_ALL_ARCHS=true  -> --all (manifest list + variantes)
+      - sinon (défaut)         -> single-arch via --override-os/--override-arch[/--override-variant]
+    On garde `--preserve-digests` pour ne jamais réécrire les manifestes.
+    """
+    src_ref = _compose_upstream_tag(reg, name, ref)  # host/ns/name:tag
+    src = f"docker://{src_ref}"
+    dest = f"docker://{TAMPON_REGISTRY}/{reg}/{name}:{ref}"
+
+    base = [
+        "skopeo", "copy",
+        "--retry-times", "3",
+        "--preserve-digests",
+        *_tls_flags(src=True, dest=True),
+    ]
+
+    # Détecte manifest list pour décider --all / overrides
+    is_index = False
+    try:
+        is_index = _is_manifest_list_src(src_ref)
+    except Exception:
+        is_index = False
+
+    if is_index:
+        # Si c'est un index : on recourt à la stratégie choisie (all ou plate-forme)
+        if MIRROR_ALL_ARCHS:
+            cmd = base + ["--all", src, dest]
+        else:
+            cmd = base + _platform_overrides() + [src, dest]
+    else:
+        # Manifest simple
+        if MIRROR_ALL_ARCHS:
+            # --all est inoffensif même si la source n'est pas une liste, mais on évite le warning
+            cmd = base + [src, dest]
+        else:
+            cmd = base + _platform_overrides() + [src, dest]
+
+    _run_skopeo(cmd)
+
+
+
+
+
+
+
+
+
+
+=== Contenu du fichier : ./api/middleware/logging.py ===
+import logging
+from datetime import datetime, UTC
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        logger = logging.getLogger("registry_nfq")
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+
+        start = datetime.now(UTC)
+        logger.info("REQ %s %s", request.method, request.url)
+        resp = await call_next(request)
+        dur = (datetime.now(UTC) - start).total_seconds()
+        logger.info("RES %s %s in %.3fs", resp.status_code, request.url.path, dur)
+        return resp
+

@@ -1,0 +1,30 @@
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: allow-system-workloads
+  namespace: {{ kyverno_namespace }}
+spec:
+  match:
+    any:
+      - resources:
+          namespaces:
+{% for ns in kyverno_exception_namespaces %}
+            - {{ ns }}
+{% endfor %}
+  exceptions:
+{% set noisy_policies = [
+  'disallow-host-path',
+  'disallow-host-namespaces',
+  'disallow-host-ports',
+  'disallow-host-process',
+  'disallow-privileged-containers',
+  'disallow-proc-mount',
+  'disallow-selinux',
+  'restrict-seccomp',
+  'restrict-sysctls',
+  'disallow-capabilities'
+] %}
+{% for pol in noisy_policies %}
+    - policyName: {{ pol }}
+      ruleNames: ["*"]
+{% endfor %}
