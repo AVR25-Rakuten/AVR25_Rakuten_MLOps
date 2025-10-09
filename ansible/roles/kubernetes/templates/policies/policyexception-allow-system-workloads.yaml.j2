@@ -11,6 +11,8 @@ spec:
 {% for ns in kyverno_exception_namespaces %}
             - {{ ns }}
 {% endfor %}
+          # on peut expliciter si tu veux
+          kinds: ["Pod","Deployment","ReplicaSet","DaemonSet","StatefulSet","Job","CronJob"]
   exceptions:
 {% set noisy_policies = [
   'disallow-host-path',
