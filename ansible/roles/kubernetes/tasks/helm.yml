@@ -17,6 +17,10 @@
         url: https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz
         dest: /tmp/helm.tar.gz
         mode: '0755'
+      register: download_result
+      until: download_result is succeeded
+      retries: 30
+      delay: 2
       when: not helm_binary.stat.exists
 
     - name: Extract Helm
