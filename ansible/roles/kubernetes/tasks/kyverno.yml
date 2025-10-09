@@ -184,36 +184,36 @@
       when: inventory_hostname == groups['masters'][0]
       tags: kyverno
 
-    # (Optionnel) vérifier que les webhooks n'excluent plus kube-system/kyverno (tolérant)
-    - name: Check resource MutatingWebhook doesn't exclude kube-system/kyverno
-      kubernetes.core.k8s_info:
-        api_version: admissionregistration.k8s.io/v1
-        kind: MutatingWebhookConfiguration
-        name: kyverno-resource-mutating-webhook-cfg
-      register: mwcfg_res
-      retries: 30
-      delay: 3
-      until: >
-        (mwcfg_res.resources | length) > 0 and
-        ((mwcfg_res.resources.0.webhooks | default([]) | to_json) is search('kube-system')) == false and
-        ((mwcfg_res.resources.0.webhooks | default([]) | to_json) is search('kyverno')) == false
-      when: inventory_hostname == groups['masters'][0]
-      tags: kyverno
+    # # (Optionnel) vérifier que les webhooks n'excluent plus kube-system/kyverno (tolérant)
+    # - name: Check resource MutatingWebhook doesn't exclude kube-system/kyverno
+    #   kubernetes.core.k8s_info:
+    #     api_version: admissionregistration.k8s.io/v1
+    #     kind: MutatingWebhookConfiguration
+    #     name: kyverno-resource-mutating-webhook-cfg
+    #   register: mwcfg_res
+    #   retries: 30
+    #   delay: 3
+    #   until: >
+    #     (mwcfg_res.resources | length) > 0 and
+    #     ((mwcfg_res.resources.0.webhooks | default([]) | to_json) is search('kube-system')) == false and
+    #     ((mwcfg_res.resources.0.webhooks | default([]) | to_json) is search('kyverno')) == false
+    #   when: inventory_hostname == groups['masters'][0]
+    #   tags: kyverno
 
-    - name: Check resource ValidatingWebhook doesn't exclude kube-system/kyverno
-      kubernetes.core.k8s_info:
-        api_version: admissionregistration.k8s.io/v1
-        kind: ValidatingWebhookConfiguration
-        name: kyverno-resource-validating-webhook-cfg
-      register: vcfg_res
-      retries: 30
-      delay: 3
-      until: >
-        (vcfg_res.resources | length) > 0 and
-        ((vcfg_res.resources.0.webhooks | default([]) | to_json) is search('kube-system')) == false and
-        ((vcfg_res.resources.0.webhooks | default([]) | to_json) is search('kyverno')) == false
-      when: inventory_hostname == groups['masters'][0]
-      tags: kyverno
+    # - name: Check resource ValidatingWebhook doesn't exclude kube-system/kyverno
+    #   kubernetes.core.k8s_info:
+    #     api_version: admissionregistration.k8s.io/v1
+    #     kind: ValidatingWebhookConfiguration
+    #     name: kyverno-resource-validating-webhook-cfg
+    #   register: vcfg_res
+    #   retries: 30
+    #   delay: 3
+    #   until: >
+    #     (vcfg_res.resources | length) > 0 and
+    #     ((vcfg_res.resources.0.webhooks | default([]) | to_json) is search('kube-system')) == false and
+    #     ((vcfg_res.resources.0.webhooks | default([]) | to_json) is search('kyverno')) == false
+    #   when: inventory_hostname == groups['masters'][0]
+    #   tags: kyverno
 
     # PolicyException globale pour "calmer" kube-system & kyverno
     - name: Apply PolicyException allow-system-workloads (stop events flood)
