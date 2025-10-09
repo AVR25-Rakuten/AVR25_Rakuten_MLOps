@@ -8,6 +8,7 @@ metadata:
 spec:
   background: false
   failurePolicy: Fail
+  validationFailureAction: Enforce
   rules:
     - name: prepend-for-all-containers
       match:
@@ -15,37 +16,39 @@ spec:
           - resources:
               kinds:
                 - Pod
+                - DaemonSet
+                - Deployment
+                - StatefulSet
+                - Job
+                - CronJob
+                - ReplicaSet
+                - ReplicationController
               namespaces:
-                - "*"        # inclut kube-system
+                - "*"
       exclude:
         any:
           - resources:
               namespaces:
-                - kyverno   # ne pas toucher à Kyverno lui-même
+                - kyverno
 {% raw %}
       preconditions:
         all:
           - key: "{{ request.operation }}"
             operator: AnyIn
-            value: ["CREATE","UPDATE"]
-
+            value: ["CREATE", "UPDATE"]
       mutate:
         foreach:
-
           # =========================
           # Containers
           # =========================
-
-          # Cas 1: SANS registry explicite -> ajouter docker.io/
+          # Cas 1: Images sans registry (ex: nginx:latest)
           - list: "request.object.spec.containers || []"
             preconditions:
               all:
-                # ne pas re-préfixer si déjà proxy
-                - key: "{{ starts_with(element.image, '192.168.200.1:8000/') }}"
+                - key: "{{ contains(element.image, '192.168.200.1:8000/') }}"
                   operator: Equals
                   value: false
-                # déterminer "pas de registry" (pas de '.' ni ':' dans le premier segment et pas 'localhost')
-                - key: "{{ (contains(split(element.image, '/')[0], '.') || contains(split(element.image, '/')[0], ':') || starts_with(split(element.image, '/')[0], 'localhost')) }}"
+                - key: "{{ contains(element.image, '/') }}"
                   operator: Equals
                   value: false
             patchStrategicMerge:
@@ -53,15 +56,14 @@ spec:
                 containers:
                   - (name): "{{ element.name }}"
                     image: "192.168.200.1:8000/docker.io/{{ element.image }}"
-
-          # Cas 2: AVEC registry explicite -> garder le registry d'origine après le proxy
+          # Cas 2: Images avec registry (ex: example.com/nginx:latest)
           - list: "request.object.spec.containers || []"
             preconditions:
               all:
-                - key: "{{ starts_with(element.image, '192.168.200.1:8000/') }}"
+                - key: "{{ contains(element.image, '192.168.200.1:8000/') }}"
                   operator: Equals
                   value: false
-                - key: "{{ (contains(split(element.image, '/')[0], '.') || contains(split(element.image, '/')[0], ':') || starts_with(split(element.image, '/')[0], 'localhost')) }}"
+                - key: "{{ contains(element.image, '/') }}"
                   operator: Equals
                   value: true
             patchStrategicMerge:
@@ -69,18 +71,17 @@ spec:
                 containers:
                   - (name): "{{ element.name }}"
                     image: "192.168.200.1:8000/{{ element.image }}"
-
           # =========================
           # Init Containers
           # =========================
-
+          # Cas 1: Images sans registry
           - list: "request.object.spec.initContainers || []"
             preconditions:
               all:
-                - key: "{{ starts_with(element.image, '192.168.200.1:8000/') }}"
+                - key: "{{ contains(element.image, '192.168.200.1:8000/') }}"
                   operator: Equals
                   value: false
-                - key: "{{ (contains(split(element.image, '/')[0], '.') || contains(split(element.image, '/')[0], ':') || starts_with(split(element.image, '/')[0], 'localhost')) }}"
+                - key: "{{ contains(element.image, '/') }}"
                   operator: Equals
                   value: false
             patchStrategicMerge:
@@ -88,14 +89,14 @@ spec:
                 initContainers:
                   - (name): "{{ element.name }}"
                     image: "192.168.200.1:8000/docker.io/{{ element.image }}"
-
+          # Cas 2: Images avec registry
           - list: "request.object.spec.initContainers || []"
             preconditions:
               all:
-                - key: "{{ starts_with(element.image, '192.168.200.1:8000/') }}"
+                - key: "{{ contains(element.image, '192.168.200.1:8000/') }}"
                   operator: Equals
                   value: false
-                - key: "{{ (contains(split(element.image, '/')[0], '.') || contains(split(element.image, '/')[0], ':') || starts_with(split(element.image, '/')[0], 'localhost')) }}"
+                - key: "{{ contains(element.image, '/') }}"
                   operator: Equals
                   value: true
             patchStrategicMerge:
@@ -103,18 +104,17 @@ spec:
                 initContainers:
                   - (name): "{{ element.name }}"
                     image: "192.168.200.1:8000/{{ element.image }}"
-
           # =========================
           # Ephemeral Containers
           # =========================
-
+          # Cas 1: Images sans registry
           - list: "request.object.spec.ephemeralContainers || []"
             preconditions:
               all:
-                - key: "{{ starts_with(element.image, '192.168.200.1:8000/') }}"
+                - key: "{{ contains(element.image, '192.168.200.1:8000/') }}"
                   operator: Equals
                   value: false
-                - key: "{{ (contains(split(element.image, '/')[0], '.') || contains(split(element.image, '/')[0], ':') || starts_with(split(element.image, '/')[0], 'localhost')) }}"
+                - key: "{{ contains(element.image, '/') }}"
                   operator: Equals
                   value: false
             patchStrategicMerge:
@@ -122,19 +122,19 @@ spec:
                 ephemeralContainers:
                   - (name): "{{ element.name }}"
                     image: "192.168.200.1:8000/docker.io/{{ element.image }}"
-
+          # Cas 2: Images avec registry
           - list: "request.object.spec.ephemeralContainers || []"
             preconditions:
               all:
-                - key: "{{ starts_with(element.image, '192.168.200.1:8000/') }}"
+                - key: "{{ contains(element.image, '192.168.200.1:8000/') }}"
                   operator: Equals
                   value: false
-                - key: "{{ (contains(split(element.image, '/')[0], '.') || contains(split(element.image, '/')[0], ':') || starts_with(split(element.image, '/')[0], 'localhost')) }}"
+                - key: "{{ contains(element.image, '/') }}"
                   operator: Equals
                   value: true
             patchStrategicMerge:
               spec:
                 ephemeralContainers:
                   - (name): "{{ element.name }}"
-                    image: "https://192.168.200.1:8000/{{ element.image }}"
+                    image: "192.168.200.1:8000/{{ element.image }}"
 {% endraw %}

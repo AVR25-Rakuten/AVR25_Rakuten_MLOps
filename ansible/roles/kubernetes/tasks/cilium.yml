@@ -160,6 +160,44 @@
       environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
       tags: [cilium]
 
+
+
+    - name: Tester la disponibilité du webhook Kyverno en déployant un pod minimal
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: kyverno-webhook-test
+            namespace: default
+          spec:
+            containers:
+              - name: busybox
+                image: busybox
+                command: ["sleep", "10"]
+            restartPolicy: Never
+      register: kyverno_webhook_test
+      until: kyverno_webhook_test is success
+      retries: 30
+      delay: 10
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      ignore_errors: yes
+      tags: [cilium, hubble]
+
+    - name: Supprimer le pod de test après succès
+      command: kubectl delete pod kyverno-webhook-test -n default --ignore-not-found
+      when: kyverno_webhook_test is success
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, hubble]
+
+
     # ===========================================================================
     # 2) MISE À JOUR CILIUM — Phase 2 : Activation du KPR (kube-proxy replacement)
     # ===========================================================================
@@ -269,6 +307,42 @@
       tags: [cilium, hubble]
 
 
+
+
+    - name: Tester la disponibilité du webhook Kyverno en déployant un pod minimal
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: kyverno-webhook-test
+            namespace: default
+          spec:
+            containers:
+              - name: busybox
+                image: busybox
+                command: ["sleep", "10"]
+            restartPolicy: Never
+      register: kyverno_webhook_test
+      until: kyverno_webhook_test is success
+      retries: 30
+      delay: 10
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      ignore_errors: yes
+      tags: [cilium, hubble]
+
+    - name: Supprimer le pod de test après succès
+      command: kubectl delete pod kyverno-webhook-test -n default --ignore-not-found
+      when: kyverno_webhook_test is success
+      run_once: true
+      delegate_to: "{{ groups['masters'][0] }}"
+      become: yes
+      environment: { KUBECONFIG: "/etc/kubernetes/admin.conf" }
+      tags: [cilium, hubble]
 
     - name: Activer Hubble Relay
       when: enable_hubble | bool
